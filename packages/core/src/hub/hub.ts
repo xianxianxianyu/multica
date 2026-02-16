@@ -31,6 +31,7 @@ import { createSetHeartbeatsHandler } from "./rpc/handlers/set-heartbeats.js";
 import { createWakeHeartbeatHandler } from "./rpc/handlers/wake-heartbeat.js";
 import { DeviceStore, type DeviceMeta } from "./device-store.js";
 import { createVerifyHandler } from "./rpc/handlers/verify.js";
+import { createGenerateChannelWelcomeHandler } from "./rpc/handlers/generate-channel-welcome.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
 import { createResolveExecApprovalHandler } from "./rpc/handlers/resolve-exec-approval.js";
 import { evaluateCommandSafety, requiresApproval } from "../agent/tools/exec-safety.js";
@@ -115,6 +116,7 @@ export class Hub {
         return this._onConfirmDevice(deviceId, agentId, meta);
       },
     }));
+    this.rpc.register("generateChannelWelcome", createGenerateChannelWelcomeHandler(this));
     this.rpc.register("getAgentMessages", createGetAgentMessagesHandler());
     this.rpc.register("getHubInfo", createGetHubInfoHandler(this));
     this.rpc.register("listAgents", createListAgentsHandler(this));

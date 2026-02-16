@@ -8,3 +8,4 @@ export { createUpdateGatewayHandler } from "./handlers/update-gateway.js";
 export { createGetLastHeartbeatHandler } from "./handlers/get-last-heartbeat.js";
 export { createSetHeartbeatsHandler } from "./handlers/set-heartbeats.js";
 export { createWakeHeartbeatHandler } from "./handlers/wake-heartbeat.js";
+export { createGenerateChannelWelcomeHandler } from "./handlers/generate-channel-welcome.js";

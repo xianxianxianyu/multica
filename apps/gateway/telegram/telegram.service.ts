@@ -82,9 +82,23 @@ interface MediaAttachment {
   caption?: string;
 }
 
+interface GenerateChannelWelcomeParams {
+  agentId: string;
+  channel: string;
+  language?: string;
+  firstName?: string;
+  isReconnect?: boolean;
+}
+
+interface GenerateChannelWelcomeResult {
+  text: string;
+}
+
 // ── Constants ──
 
 const VERIFY_TIMEOUT_MS = 30_000;
+const WELCOME_RPC_TIMEOUT_MS = 20_000;
+const WELCOME_COOLDOWN_MS = 15_000;
 const TYPING_TIMEOUT_MS = 60_000;
 const MAX_CHARS_PER_MESSAGE = 4000; // Telegram limit is 4096; leave room for HTML overhead
 const REPLY_CONTEXT_MAX_CHARS = 300; // Max chars of quoted text when user replies to a message
@@ -170,6 +184,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private typingTimers = new Map<string, ReturnType<typeof setInterval>>();
   /** Tracks the originating message for reply_to & reaction cleanup, keyed by deviceId */
   private messageContexts = new Map<string, MessageContext>();
+  /** Deduplicate welcome sends when Telegram replays updates in a short window */
+  private welcomeSentAt = new Map<string, number>();
 
   private readonly logger = new Logger(TelegramService.name);
 
@@ -1076,6 +1092,16 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         { parse_mode: "HTML", reply_markup: successKeyboard },
       );
 
+      await this.sendAgentWelcomeAfterConnect({
+        telegramUserId,
+        deviceId,
+        hubId: result.hubId,
+        agentId: result.agentId,
+        languageCode: msg?.from?.language_code,
+        firstName: msg?.from?.first_name,
+        isReconnect: !!existingUser,
+      });
+
       this.logger.log(
         `Telegram user verified: telegramUserId=${telegramUserId}, hubId=${connectionInfo.hubId}, deviceId=${deviceId}`,
       );
@@ -1105,20 +1131,87 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Send a verify RPC to Hub via the virtual device */
-  private sendVerifyRpc(
+  private shouldSendConnectWelcome(telegramUserId: string): boolean {
+    const now = Date.now();
+    const lastSentAt = this.welcomeSentAt.get(telegramUserId);
+    if (lastSentAt && now - lastSentAt < WELCOME_COOLDOWN_MS) {
+      return false;
+    }
+    this.welcomeSentAt.set(telegramUserId, now);
+    return true;
+  }
+
+  private buildFallbackConnectWelcome(firstName: string | undefined, isReconnect: boolean): string {
+    const safeName = firstName?.trim() || "there";
+    if (isReconnect) {
+      return (
+        `Welcome back, ${safeName}. I am your Multica AI agent and I am ready again.\n\n` +
+        `I can help with research, drafting, and step-by-step problem solving.\n` +
+        `What should we work on now?`
+      );
+    }
+    return (
+      `Hi ${safeName}, I am your Multica AI agent.\n\n` +
+      `I can help with research, drafting, and step-by-step problem solving.\n` +
+      `What would you like to do first?`
+    );
+  }
+
+  private async sendAgentWelcomeAfterConnect(opts: {
+    telegramUserId: string;
+    deviceId: string;
+    hubId: string;
+    agentId: string;
+    languageCode?: string;
+    firstName?: string;
+    isReconnect: boolean;
+  }): Promise<void> {
+    if (!this.shouldSendConnectWelcome(opts.telegramUserId)) {
+      this.logger.debug(`Connect welcome skipped by cooldown: telegramUserId=${opts.telegramUserId}`);
+      return;
+    }
+
+    try {
+      const language = opts.languageCode?.trim().slice(0, 16) || undefined;
+      const firstName = opts.firstName?.trim().slice(0, 32) || undefined;
+      const result = await this.sendGenerateChannelWelcomeRpc(opts.deviceId, opts.hubId, {
+        agentId: opts.agentId,
+        channel: "telegram",
+        language,
+        firstName,
+        isReconnect: opts.isReconnect,
+      });
+      const welcomeText = result.text.trim();
+      if (welcomeText) {
+        await this.sendToTelegram(opts.deviceId, welcomeText);
+        return;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`generateChannelWelcome failed: deviceId=${opts.deviceId}, error=${message}`);
+    }
+
+    await this.sendToTelegram(
+      opts.deviceId,
+      this.buildFallbackConnectWelcome(opts.firstName, opts.isReconnect),
+    );
+  }
+
+  private sendRpc<TParams, TResult>(
     deviceId: string,
     hubId: string,
-    token: string,
-    meta: DeviceMeta,
-  ): Promise<VerifyResult> {
-    return new Promise<VerifyResult>((resolve, reject) => {
+    method: string,
+    params: TParams,
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): Promise<TResult> {
+    return new Promise<TResult>((resolve, reject) => {
       const requestId = uuidv7();
 
       const timer = setTimeout(() => {
         this.pendingRequests.delete(requestId);
-        reject(new Error("Verify request timed out"));
-      }, VERIFY_TIMEOUT_MS);
+        reject(new Error(timeoutMessage));
+      }, timeoutMs);
 
       this.pendingRequests.set(requestId, {
         resolve: resolve as (v: unknown) => void,
@@ -1126,13 +1219,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         timer,
       });
 
-      const payload: RequestPayload<VerifyParams> = {
+      const payload: RequestPayload<TParams> = {
         requestId,
-        method: "verify",
-        params: { token, meta },
+        method,
+        params,
       };
 
-      const message: RoutedMessage<RequestPayload<VerifyParams>> = {
+      const message: RoutedMessage<RequestPayload<TParams>> = {
         id: uuidv7(),
         uid: null,
         from: deviceId,
@@ -1145,9 +1238,42 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       if (!sent) {
         this.pendingRequests.delete(requestId);
         clearTimeout(timer);
-        reject(new Error("Failed to route verify request to Hub"));
+        reject(new Error(`Failed to route ${method} request to Hub`));
       }
     });
+  }
+
+  /** Send a verify RPC to Hub via the virtual device */
+  private sendVerifyRpc(
+    deviceId: string,
+    hubId: string,
+    token: string,
+    meta: DeviceMeta,
+  ): Promise<VerifyResult> {
+    return this.sendRpc<VerifyParams, VerifyResult>(
+      deviceId,
+      hubId,
+      "verify",
+      { token, meta },
+      VERIFY_TIMEOUT_MS,
+      "Verify request timed out",
+    );
+  }
+
+  /** Ask Hub agent to generate a proactive Telegram welcome message */
+  private sendGenerateChannelWelcomeRpc(
+    deviceId: string,
+    hubId: string,
+    params: GenerateChannelWelcomeParams,
+  ): Promise<GenerateChannelWelcomeResult> {
+    return this.sendRpc<GenerateChannelWelcomeParams, GenerateChannelWelcomeResult>(
+      deviceId,
+      hubId,
+      "generateChannelWelcome",
+      params,
+      WELCOME_RPC_TIMEOUT_MS,
+      "Welcome generation timed out",
+    );
   }
 
   /** Route a regular chat message to the user's Hub agent */
