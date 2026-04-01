@@ -5,6 +5,7 @@ export const en: LandingDict = {
   header: {
     github: "GitHub",
     login: "Log in",
+    dashboard: "Dashboard",
   },
 
   hero: {

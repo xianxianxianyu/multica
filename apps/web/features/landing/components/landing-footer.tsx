@@ -3,10 +3,12 @@
 import Link from "next/link";
 import { MulticaIcon } from "@/components/multica-icon";
 import { cn } from "@/lib/utils";
+import { useAuthStore } from "@/features/auth";
 import { useLocale, locales, localeLabels } from "../i18n";
 
 export function LandingFooter() {
   const { t, locale, setLocale } = useLocale();
+  const user = useAuthStore((s) => s.user);
   const groups = Object.values(t.footer.groups);
 
   return (
@@ -27,10 +29,10 @@ export function LandingFooter() {
             </p>
             <div className="mt-6">
               <Link
-                href="/login"
+                href={user ? "/issues" : "/login"}
                 className="inline-flex items-center justify-center rounded-[11px] bg-white px-5 py-2.5 text-[13px] font-semibold text-[#0a0d12] transition-colors hover:bg-white/88"
               >
-                {t.footer.cta}
+                {user ? t.header.dashboard : t.footer.cta}
               </Link>
             </div>
           </div>

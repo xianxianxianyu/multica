@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Image from "next/image";
 import {
   Bot,
   Brain,
@@ -1047,8 +1048,16 @@ export function FeaturesSection() {
                 {/* Visual */}
                 <div className="mt-14 sm:mt-18">
                   {feature.visual ? (
-                    <div className="relative overflow-hidden rounded-sm" style={{ backgroundImage: `url(${feature.bgImage ?? "/images/feature-bg.jpg"})`, backgroundSize: "cover", backgroundPosition: "center" }}>
-                      <div className="px-4 py-8 sm:px-6 sm:py-12 lg:px-8 lg:py-16">
+                    <div className="relative overflow-hidden rounded-sm">
+                      <Image
+                        src={feature.bgImage ?? "/images/feature-bg.jpg"}
+                        alt=""
+                        fill
+                        className="object-cover object-center"
+                        sizes="(max-width: 1320px) 100vw, 1320px"
+                        quality={80}
+                      />
+                      <div className="relative px-4 py-8 sm:px-6 sm:py-12 lg:px-8 lg:py-16">
                         <feature.visual />
                       </div>
                     </div>

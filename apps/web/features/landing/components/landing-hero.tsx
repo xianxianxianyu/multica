@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import Link from "next/link";
+import { useAuthStore } from "@/features/auth";
 import { useLocale } from "../i18n";
 import {
   ClaudeCodeLogo,
@@ -13,6 +14,7 @@ import {
 
 export function LandingHero() {
   const { t } = useLocale();
+  const user = useAuthStore((s) => s.user);
 
   return (
     <div className="relative min-h-full overflow-hidden bg-[#05070b] text-white">
@@ -35,8 +37,8 @@ export function LandingHero() {
             </p>
 
             <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
-              <Link href="/login" className={heroButtonClassName("solid")}>
-                {t.hero.cta}
+              <Link href={user ? "/issues" : "/login"} className={heroButtonClassName("solid")}>
+                {user ? t.header.dashboard : t.hero.cta}
               </Link>
               <Link
                 href={githubUrl}
@@ -93,11 +95,14 @@ function ProductImage({ alt }: { alt: string }) {
   return (
     <div>
       <div className="relative overflow-hidden border border-white/14">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
+        <Image
           src="/images/landing-hero.png"
           alt={alt}
-          className="block w-full"
+          width={3532}
+          height={2382}
+          className="block h-auto w-full"
+          sizes="(max-width: 1320px) 100vw, 1320px"
+          quality={85}
         />
       </div>
     </div>

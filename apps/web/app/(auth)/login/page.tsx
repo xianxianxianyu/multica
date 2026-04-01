@@ -46,10 +46,19 @@ function redirectToCliCallback(
 
 function LoginPageContent() {
   const router = useRouter();
+  const user = useAuthStore((s) => s.user);
+  const isLoading = useAuthStore((s) => s.isLoading);
   const sendCode = useAuthStore((s) => s.sendCode);
   const verifyCode = useAuthStore((s) => s.verifyCode);
   const hydrateWorkspace = useWorkspaceStore((s) => s.hydrateWorkspace);
   const searchParams = useSearchParams();
+
+  // Already authenticated — redirect to dashboard
+  useEffect(() => {
+    if (!isLoading && user && !searchParams.get("cli_callback")) {
+      router.replace(searchParams.get("next") || "/issues");
+    }
+  }, [isLoading, user, router, searchParams]);
 
   const [step, setStep] = useState<"email" | "code" | "cli_confirm">("email");
   const [email, setEmail] = useState("");

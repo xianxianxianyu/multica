@@ -76,9 +76,9 @@ export function AppSidebar() {
   const unreadCount = useInboxStore((s) => s.unreadCount());
 
   const logout = () => {
+    router.push("/");
     authLogout();
     useWorkspaceStore.getState().clearWorkspace();
-    router.push("/login");
   };
 
   return (

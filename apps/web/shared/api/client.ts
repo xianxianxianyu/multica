@@ -74,8 +74,8 @@ export class ApiClient {
       localStorage.removeItem("multica_workspace_id");
       this.token = null;
       this.workspaceId = null;
-      if (window.location.pathname !== "/login") {
-        window.location.href = "/login";
+      if (window.location.pathname !== "/") {
+        window.location.href = "/";
       }
     }
   }

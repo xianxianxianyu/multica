@@ -7,17 +7,8 @@ import type { LandingDict, Locale } from "./types";
 
 const dictionaries: Record<Locale, LandingDict> = { en, zh };
 
-const STORAGE_KEY = "multica-locale";
-
-function getInitialLocale(): Locale {
-  if (typeof window === "undefined") return "en";
-  const stored = localStorage.getItem(STORAGE_KEY);
-  if (stored === "en" || stored === "zh") return stored;
-  // Detect from browser language
-  const lang = navigator.language;
-  if (lang.startsWith("zh")) return "zh";
-  return "en";
-}
+const COOKIE_NAME = "multica-locale";
+const COOKIE_MAX_AGE = 60 * 60 * 24 * 365; // 1 year
 
 type LocaleContextValue = {
   locale: Locale;
@@ -27,12 +18,18 @@ type LocaleContextValue = {
 
 const LocaleContext = createContext<LocaleContextValue | null>(null);
 
-export function LocaleProvider({ children }: { children: React.ReactNode }) {
-  const [locale, setLocaleState] = useState<Locale>(getInitialLocale);
+export function LocaleProvider({
+  children,
+  initialLocale = "en",
+}: {
+  children: React.ReactNode;
+  initialLocale?: Locale;
+}) {
+  const [locale, setLocaleState] = useState<Locale>(initialLocale);
 
   const setLocale = useCallback((l: Locale) => {
     setLocaleState(l);
-    localStorage.setItem(STORAGE_KEY, l);
+    document.cookie = `${COOKIE_NAME}=${l}; path=/; max-age=${COOKIE_MAX_AGE}; SameSite=Lax`;
   }, []);
 
   return (

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { MulticaIcon } from "@/components/multica-icon";
 import { cn } from "@/lib/utils";
+import { useAuthStore } from "@/features/auth";
 import { useLocale } from "../i18n";
 import { GitHubMark, githubUrl, headerButtonClassName } from "./shared";
 
@@ -12,6 +13,7 @@ export function LandingHeader({
   variant?: "dark" | "light";
 }) {
   const { t } = useLocale();
+  const user = useAuthStore((s) => s.user);
 
   return (
     <header
@@ -52,10 +54,10 @@ export function LandingHeader({
             {t.header.github}
           </Link>
           <Link
-            href="/login"
+            href={user ? "/issues" : "/login"}
             className={headerButtonClassName("solid", variant)}
           >
-            {t.header.login}
+            {user ? t.header.dashboard : t.header.login}
           </Link>
         </div>
       </div>
