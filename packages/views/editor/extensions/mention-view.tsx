@@ -21,8 +21,9 @@
 import { NodeViewWrapper } from "@tiptap/react";
 import type { NodeViewProps } from "@tiptap/react";
 import { useQuery } from "@tanstack/react-query";
-import { issueListOptions } from "@multica/core/issues/queries";
+import { issueListOptions, issueDetailOptions } from "@multica/core/issues/queries";
 import { useWorkspaceId } from "@multica/core/hooks";
+import { useWorkspacePaths } from "@multica/core/paths";
 import { useNavigation } from "../../navigation";
 import { StatusIcon } from "../../issues/components/status-icon";
 
@@ -52,20 +53,30 @@ function IssueMention({
   fallbackLabel?: string;
 }) {
   const wsId = useWorkspaceId();
+  const p = useWorkspacePaths();
   const { data: issues = [] } = useQuery(issueListOptions(wsId));
-  const { openInNewTab } = useNavigation();
-  const issue = issues.find((i) => i.id === issueId);
+  const { push, openInNewTab } = useNavigation();
+  const listIssue = issues.find((i) => i.id === issueId);
 
-  const issuePath = `/issues/${issueId}`;
+  const { data: detailIssue } = useQuery({
+    ...issueDetailOptions(wsId, issueId),
+    enabled: !listIssue,
+  });
+
+  const issue = listIssue ?? detailIssue;
+
+  const issuePath = p.issueDetail(issueId);
   const tabTitle = issue ? `${issue.identifier}: ${issue.title}` : undefined;
   const handleClick = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (openInNewTab) {
-      openInNewTab(issuePath, tabTitle);
-    } else {
-      window.open(issuePath, "_blank", "noopener,noreferrer");
+    if (e.metaKey || e.ctrlKey || e.shiftKey) {
+      if (openInNewTab) {
+        openInNewTab(issuePath, tabTitle);
+      }
+      return;
     }
+    push(issuePath);
   };
 
   const cardClass =
@@ -73,7 +84,7 @@ function IssueMention({
 
   if (!issue) {
     return (
-      <a href={`/issues/${issueId}`} onClick={handleClick} className={cardClass}>
+      <a href={issuePath} onClick={handleClick} className={cardClass}>
         <span className="font-medium text-muted-foreground">
           {fallbackLabel ?? issueId.slice(0, 8)}
         </span>
@@ -82,7 +93,7 @@ function IssueMention({
   }
 
   return (
-    <a href={`/issues/${issueId}`} onClick={handleClick} className={cardClass}>
+    <a href={issuePath} onClick={handleClick} className={cardClass}>
       <StatusIcon status={issue.status} className="h-3.5 w-3.5 shrink-0" />
       <span className="font-medium text-muted-foreground shrink-0">{issue.identifier}</span>
       <span className="text-foreground truncate">{issue.title}</span>

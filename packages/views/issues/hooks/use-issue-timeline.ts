@@ -34,6 +34,7 @@ function commentToTimelineEntry(c: Comment): TimelineEntry {
     updated_at: c.updated_at,
     comment_type: c.type,
     reactions: c.reactions ?? [],
+    attachments: c.attachments ?? [],
   };
 }
 
@@ -69,7 +70,9 @@ export function useIssueTimeline(issueId: string, userId?: string) {
           (old) => {
             if (!old) return old;
             if (old.some((e) => e.id === comment.id)) return old;
-            return [...old, commentToTimelineEntry(comment)];
+            return [...old, commentToTimelineEntry(comment)].sort(
+              (a, b) => a.created_at.localeCompare(b.created_at),
+            );
           },
         );
       },
@@ -143,7 +146,9 @@ export function useIssueTimeline(issueId: string, userId?: string) {
           (old) => {
             if (!old) return old;
             if (old.some((e) => e.id === entry.id)) return old;
-            return [...old, entry];
+            return [...old, entry].sort(
+              (a, b) => a.created_at.localeCompare(b.created_at),
+            );
           },
         );
       },

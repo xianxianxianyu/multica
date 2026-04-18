@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,14 +15,16 @@ import (
 
 // HealthResponse is returned by the daemon's local health endpoint.
 type HealthResponse struct {
-	Status     string            `json:"status"`
-	PID        int               `json:"pid"`
-	Uptime     string            `json:"uptime"`
-	DaemonID   string            `json:"daemon_id"`
-	DeviceName string            `json:"device_name"`
-	ServerURL  string            `json:"server_url"`
-	Agents     []string          `json:"agents"`
-	Workspaces []healthWorkspace `json:"workspaces"`
+	Status          string            `json:"status"`
+	PID             int               `json:"pid"`
+	Uptime          string            `json:"uptime"`
+	DaemonID        string            `json:"daemon_id"`
+	DeviceName      string            `json:"device_name"`
+	ServerURL       string            `json:"server_url"`
+	CLIVersion      string            `json:"cli_version"`
+	ActiveTaskCount int64             `json:"active_task_count"`
+	Agents          []string          `json:"agents"`
+	Workspaces      []healthWorkspace `json:"workspaces"`
 }
 
 type healthWorkspace struct {
@@ -49,11 +52,10 @@ type repoCheckoutRequest struct {
 	TaskID      string `json:"task_id"`
 }
 
-// serveHealth runs the health HTTP server on the given listener.
-// Blocks until ctx is cancelled.
-func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt time.Time) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+// healthHandler returns the /health HTTP handler. Extracted from serveHealth
+// so tests can exercise it without spinning up a listener.
+func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		d.mu.Lock()
 		var wsList []healthWorkspace
 		for id, ws := range d.workspaces {
@@ -70,19 +72,28 @@ func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt tim
 		}
 
 		resp := HealthResponse{
-			Status:     "running",
-			PID:        os.Getpid(),
-			Uptime:     time.Since(startedAt).Truncate(time.Second).String(),
-			DaemonID:   d.cfg.DaemonID,
-			DeviceName: d.cfg.DeviceName,
-			ServerURL:  d.cfg.ServerBaseURL,
-			Agents:     agents,
-			Workspaces: wsList,
+			Status:          "running",
+			PID:             os.Getpid(),
+			Uptime:          time.Since(startedAt).Truncate(time.Second).String(),
+			DaemonID:        d.cfg.DaemonID,
+			DeviceName:      d.cfg.DeviceName,
+			ServerURL:       d.cfg.ServerBaseURL,
+			CLIVersion:      d.cfg.CLIVersion,
+			ActiveTaskCount: d.activeTasks.Load(),
+			Agents:          agents,
+			Workspaces:      wsList,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
-	})
+	}
+}
+
+// serveHealth runs the health HTTP server on the given listener.
+// Blocks until ctx is cancelled.
+func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt time.Time) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", d.healthHandler(startedAt))
 
 	mux.HandleFunc("/repo/checkout", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -99,6 +110,10 @@ func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt tim
 			http.Error(w, "url is required", http.StatusBadRequest)
 			return
 		}
+		if req.WorkspaceID == "" {
+			http.Error(w, "workspace_id is required", http.StatusBadRequest)
+			return
+		}
 		if req.WorkDir == "" {
 			http.Error(w, "workdir is required", http.StatusBadRequest)
 			return
@@ -106,6 +121,16 @@ func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt tim
 
 		if d.repoCache == nil {
 			http.Error(w, "repo cache not initialized", http.StatusInternalServerError)
+			return
+		}
+
+		if err := d.ensureRepoReady(r.Context(), req.WorkspaceID, req.URL); err != nil {
+			statusCode := http.StatusInternalServerError
+			if errors.Is(err, ErrRepoNotConfigured) {
+				statusCode = http.StatusBadRequest
+			}
+			d.logger.Error("repo checkout readiness failed", "workspace_id", req.WorkspaceID, "url", req.URL, "error", err)
+			http.Error(w, err.Error(), statusCode)
 			return
 		}
 
@@ -138,3 +163,4 @@ func (d *Daemon) serveHealth(ctx context.Context, ln net.Listener, startedAt tim
 		d.logger.Warn("health server error", "error", err)
 	}
 }
+

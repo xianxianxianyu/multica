@@ -16,22 +16,26 @@
  * - Rendering mentions with the same IssueMentionCard component and .mention class
  */
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import ReactMarkdown, {
   defaultUrlTransform,
   type Components,
 } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { createLowlight, common } from "lowlight";
 // @ts-expect-error -- hast-util-to-html has no bundled type declarations
 import { toHtml } from "hast-util-to-html";
 import { Maximize2, Download, Link as LinkIcon, FileText } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@multica/ui/lib/utils";
+import { useWorkspacePaths, useWorkspaceSlug } from "@multica/core/paths";
 import { useNavigation } from "../navigation";
 import { IssueMentionCard } from "../issues/components/issue-mention-card";
 import { ImageLightbox } from "./extensions/image-view";
+import { useLinkHover, LinkHoverCard } from "./link-hover-card";
+import { openLink, isMentionHref } from "./utils/link-handler";
 import { preprocessMarkdown } from "./utils/preprocess";
 import "./content-editor.css";
 
@@ -40,6 +44,36 @@ import "./content-editor.css";
 // ---------------------------------------------------------------------------
 
 const lowlight = createLowlight(common);
+
+// ---------------------------------------------------------------------------
+// Sanitization schema — extends GitHub defaults to allow file-card data attrs
+// ---------------------------------------------------------------------------
+
+const sanitizeSchema = {
+  ...defaultSchema,
+  protocols: {
+    ...defaultSchema.protocols,
+    href: [...(defaultSchema.protocols?.href ?? []), "mention"],
+  },
+  attributes: {
+    ...defaultSchema.attributes,
+    div: [
+      ...(defaultSchema.attributes?.div ?? []),
+      "dataType",
+      "dataHref",
+      "dataFilename",
+    ],
+    code: [
+      ...(defaultSchema.attributes?.code ?? []),
+      ["className", /^language-/],
+      ["className", /^hljs/],
+    ],
+    img: [
+      ...(defaultSchema.attributes?.img ?? []),
+      "alt",
+    ],
+  },
+};
 
 // ---------------------------------------------------------------------------
 // URL transform — allow mention:// protocol through react-markdown's sanitizer
@@ -55,19 +89,22 @@ function urlTransform(url: string): string {
 // ---------------------------------------------------------------------------
 
 function IssueMentionLink({ issueId, label }: { issueId: string; label?: string }) {
-  const { openInNewTab } = useNavigation();
-  const path = `/issues/${issueId}`;
+  const { push, openInNewTab } = useNavigation();
+  const p = useWorkspacePaths();
+  const path = p.issueDetail(issueId);
   return (
     <span
       className="inline align-middle"
       onClick={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        if (openInNewTab) {
-          openInNewTab(path, label);
-        } else {
-          window.open(path, "_blank", "noopener,noreferrer");
+        if (e.metaKey || e.ctrlKey || e.shiftKey) {
+          if (openInNewTab) {
+            openInNewTab(path, label);
+          }
+          return;
         }
+        push(path);
       }}
     >
       <IssueMentionCard issueId={issueId} fallbackLabel={label} />
@@ -75,39 +112,50 @@ function IssueMentionLink({ issueId, label }: { issueId: string; label?: string 
   );
 }
 
-const components: Partial<Components> = {
-  // Links — route mention:// to mention components, others open in new tab
-  a: ({ href, children }) => {
-    if (href?.startsWith("mention://")) {
-      const match = href.match(
-        /^mention:\/\/(member|agent|issue|all)\/(.+)$/,
-      );
-      if (match?.[1] === "issue" && match[2]) {
-        const label =
-          typeof children === "string"
-            ? children
-            : Array.isArray(children)
-              ? children.join("")
-              : undefined;
-        return <IssueMentionLink issueId={match[2]} label={label} />;
-      }
-      // Member / agent / all mentions
-      return <span className="mention">{children}</span>;
-    }
+// Named component so it can call useWorkspaceSlug() — arrow function inlined
+// inside `components` below would still work, but extracting it keeps the
+// hook usage explicit and avoids hook-in-object-literal surprises.
+function ReadonlyLink({
+  href,
+  children,
+}: {
+  href?: string;
+  children?: React.ReactNode;
+}) {
+  const slug = useWorkspaceSlug();
 
-    // Regular links — open in new tab
-    return (
-      <a
-        href={href}
-        onClick={(e) => {
-          e.preventDefault();
-          if (href) window.open(href, "_blank", "noopener,noreferrer");
-        }}
-      >
-        {children}
-      </a>
-    );
-  },
+  if (isMentionHref(href)) {
+    const match = href.match(/^mention:\/\/(member|agent|issue|all)\/(.+)$/);
+    if (match?.[1] === "issue" && match[2]) {
+      const label =
+        typeof children === "string"
+          ? children
+          : Array.isArray(children)
+            ? children.join("")
+            : undefined;
+      return <IssueMentionLink issueId={match[2]} label={label} />;
+    }
+    // Member / agent / all mentions
+    return <span className="mention">{children}</span>;
+  }
+
+  // Regular links — open directly on click
+  return (
+    <a
+      href={href}
+      onClick={(e) => {
+        e.preventDefault();
+        if (href) openLink(href, slug);
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+const components: Partial<Components> = {
+  // Links — route mention:// to mention components, others show preview card
+  a: ReadonlyLink,
 
   // Images — centered with toolbar + lightbox (matches Tiptap ImageView NodeView)
   img: function ReadonlyImage({ src, alt }) {
@@ -159,7 +207,9 @@ const components: Partial<Components> = {
   div: ({ node, children, ...props }) => {
     const dataType = node?.properties?.dataType as string | undefined;
     if (dataType === "fileCard") {
-      const href = (node?.properties?.dataHref as string) || "";
+      const rawHref = (node?.properties?.dataHref as string) || "";
+      // Only allow http(s) URLs to prevent javascript: and other dangerous schemes.
+      const href = /^https?:\/\//i.test(rawHref) ? rawHref : "";
       const filename = (node?.properties?.dataFilename as string) || "";
       return (
         <div className="my-1 flex items-center gap-2 rounded-md border border-border bg-muted/50 px-2.5 py-1 transition-colors hover:bg-muted">
@@ -238,17 +288,20 @@ interface ReadonlyContentProps {
 
 export function ReadonlyContent({ content, className }: ReadonlyContentProps) {
   const processed = useMemo(() => preprocessMarkdown(content), [content]);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const hover = useLinkHover(wrapperRef);
 
   return (
-    <div className={cn("rich-text-editor readonly text-sm", className)}>
+    <div ref={wrapperRef} className={cn("rich-text-editor readonly text-sm", className)}>
       <ReactMarkdown
         remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
-        rehypePlugins={[rehypeRaw]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
         urlTransform={urlTransform}
         components={components}
       >
         {processed}
       </ReactMarkdown>
+      <LinkHoverCard {...hover} />
     </div>
   );
 }

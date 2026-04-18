@@ -4,9 +4,13 @@
  * Uses raw fetch so E2E tests have zero build-time coupling to the web app.
  */
 
+import "./env";
 import pg from "pg";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? `http://localhost:${process.env.PORT ?? "8080"}`;
+// `||` (not `??`) so an empty `NEXT_PUBLIC_API_URL=` in .env still falls
+// back to localhost. dotenv sets unset-vs-empty both as "" — treating them
+// the same matches user intent.
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || `http://localhost:${process.env.PORT || "8080"}`;
 const DATABASE_URL = process.env.DATABASE_URL ?? "postgres://multica:multica@localhost:5432/multica?sslmode=disable";
 
 interface TestWorkspace {
@@ -17,43 +21,48 @@ interface TestWorkspace {
 
 export class TestApiClient {
   private token: string | null = null;
+  private workspaceSlug: string | null = null;
   private workspaceId: string | null = null;
   private createdIssueIds: string[] = [];
 
   async login(email: string, name: string) {
-    // Step 1: Send verification code
-    const sendRes = await fetch(`${API_BASE}/auth/send-code`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email }),
-    });
-    if (!sendRes.ok) {
-      // Rate limited — code already sent recently, read it from DB
-      if (sendRes.status !== 429) {
-        throw new Error(`send-code failed: ${sendRes.status}`);
-      }
-    }
-
-    // Step 2: Read code from database
     const client = new pg.Client(DATABASE_URL);
     await client.connect();
     try {
+      // Keep each E2E login isolated so previous test runs do not trip the
+      // per-email send-code rate limit.
+      await client.query("DELETE FROM verification_code WHERE email = $1", [email]);
+
+      // Step 1: Send verification code
+      const sendRes = await fetch(`${API_BASE}/auth/send-code`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      if (!sendRes.ok) {
+        throw new Error(`send-code failed: ${sendRes.status}`);
+      }
+
+      // Step 2: Read code from database
       const result = await client.query(
         "SELECT code FROM verification_code WHERE email = $1 AND used = FALSE AND expires_at > now() ORDER BY created_at DESC LIMIT 1",
-        [email]
+        [email],
       );
       if (result.rows.length === 0) {
         throw new Error(`No verification code found for ${email}`);
       }
-      const code = result.rows[0].code;
 
       // Step 3: Verify code to get JWT
       const verifyRes = await fetch(`${API_BASE}/auth/verify-code`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, code }),
+        body: JSON.stringify({ email, code: result.rows[0].code }),
       });
+      if (!verifyRes.ok) {
+        throw new Error(`verify-code failed: ${verifyRes.status}`);
+      }
       const data = await verifyRes.json();
+
       this.token = data.token;
 
       // Update user name if needed
@@ -63,6 +72,8 @@ export class TestApiClient {
           body: JSON.stringify({ name }),
         });
       }
+
+      await client.query("DELETE FROM verification_code WHERE email = $1", [email]);
 
       return data;
     } finally {
@@ -79,11 +90,16 @@ export class TestApiClient {
     this.workspaceId = id;
   }
 
+  setWorkspaceSlug(slug: string) {
+    this.workspaceSlug = slug;
+  }
+
   async ensureWorkspace(name = "E2E Workspace", slug = "e2e-workspace") {
     const workspaces = await this.getWorkspaces();
     const workspace = workspaces.find((item) => item.slug === slug) ?? workspaces[0];
     if (workspace) {
       this.workspaceId = workspace.id;
+      this.workspaceSlug = workspace.slug;
       return workspace;
     }
 
@@ -143,7 +159,8 @@ export class TestApiClient {
       ...((init?.headers as Record<string, string>) ?? {}),
     };
     if (this.token) headers["Authorization"] = `Bearer ${this.token}`;
-    if (this.workspaceId) headers["X-Workspace-ID"] = this.workspaceId;
+    if (this.workspaceSlug) headers["X-Workspace-Slug"] = this.workspaceSlug;
+    else if (this.workspaceId) headers["X-Workspace-ID"] = this.workspaceId;
     return fetch(`${API_BASE}${path}`, { ...init, headers });
   }
 }

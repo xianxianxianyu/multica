@@ -7,6 +7,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "@multica/ui/components/
 import { Button } from "@multica/ui/components/ui/button";
 import type { Issue, IssueStatus } from "@multica/core/types";
 import { useLoadMoreDoneIssues } from "@multica/core/issues/mutations";
+import type { MyIssuesFilter } from "@multica/core/issues/queries";
 import { STATUS_CONFIG } from "@multica/core/issues/config";
 import { useModalStore } from "@multica/core/modals";
 import { useViewStore } from "@multica/core/issues/stores/view-store-context";
@@ -23,12 +24,17 @@ export function ListView({
   visibleStatuses,
   childProgressMap = EMPTY_PROGRESS_MAP,
   doneTotal: doneTotalOverride,
+  myIssuesScope,
+  myIssuesFilter,
 }: {
   issues: Issue[];
   visibleStatuses: IssueStatus[];
   childProgressMap?: Map<string, ChildProgress>;
-  /** Override the done-group count (e.g. with a client-filtered total). */
+  /** Override the done-group count (e.g. with a server-filtered total). */
   doneTotal?: number;
+  /** When set, use the My Issues load-more hook instead of the workspace one. */
+  myIssuesScope?: string;
+  myIssuesFilter?: MyIssuesFilter;
 }) {
   const sortBy = useViewStore((s) => s.sortBy);
   const sortDirection = useViewStore((s) => s.sortDirection);
@@ -41,7 +47,9 @@ export function ListView({
   const selectedIds = useIssueSelectionStore((s) => s.selectedIds);
   const select = useIssueSelectionStore((s) => s.select);
   const deselect = useIssueSelectionStore((s) => s.deselect);
-  const { loadMore, hasMore, isLoading: loadingMore, doneTotal: hookDoneTotal } = useLoadMoreDoneIssues();
+  const myIssuesOpts = myIssuesScope ? { scope: myIssuesScope, filter: myIssuesFilter ?? {} } : undefined;
+  const { loadMore, hasMore, isLoading: loadingMore, doneTotal: hookDoneTotal } =
+    useLoadMoreDoneIssues(myIssuesOpts);
   const displayDoneTotal = doneTotalOverride ?? hookDoneTotal;
 
   const issuesByStatus = useMemo(() => {

@@ -25,14 +25,6 @@ var authCmd = &cobra.Command{
 	Short: "Authenticate multica with Multica",
 }
 
-var authLoginCmd = &cobra.Command{
-	Use:    "login",
-	Short:  "Authenticate with Multica",
-	Long:   "Authenticate with Multica without auto-configuring workspaces. Use 'multica login' for the guided setup flow.",
-	Hidden: true,
-	RunE:   runAuthLogin,
-}
-
 var authStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show current authentication status",
@@ -46,8 +38,6 @@ var authLogoutCmd = &cobra.Command{
 }
 
 func init() {
-	authLoginCmd.Flags().Bool("token", false, "Authenticate by pasting a personal access token")
-	authCmd.AddCommand(authLoginCmd)
 	authCmd.AddCommand(authStatusCmd)
 	authCmd.AddCommand(authLogoutCmd)
 }
@@ -72,7 +62,9 @@ func resolveAppURL(cmd *cobra.Command) string {
 	if err == nil && cfg.AppURL != "" {
 		return strings.TrimRight(cfg.AppURL, "/")
 	}
-	return "https://multica.ai"
+	fmt.Fprintln(os.Stderr, "No app URL configured. Run 'multica setup' first.")
+	os.Exit(1)
+	return "" // unreachable
 }
 
 func openBrowser(url string) error {
@@ -87,7 +79,7 @@ func openBrowser(url string) error {
 		args = []string{url}
 	case "windows":
 		cmd = "cmd"
-		args = []string{"/c", "start", url}
+		args = []string{"/c", "start", "", url}
 	default:
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
@@ -106,15 +98,31 @@ func runAuthLoginBrowser(cmd *cobra.Command) error {
 	serverURL := resolveServerURL(cmd)
 	appURL := resolveAppURL(cmd)
 
+	// Determine the callback host from the configured app URL.
+	// For self-hosted setups where the browser is on a different machine
+	// (e.g. Multica running on a LAN server), use the server's private IP
+	// so the browser can reach the CLI's local HTTP server.
+	// For production (public hostnames like multica.ai), keep localhost —
+	// the browser and CLI are on the same machine.
+	callbackHost := "localhost"
+	bindAddr := "127.0.0.1"
+	if parsed, err := url.Parse(appURL); err == nil {
+		h := parsed.Hostname()
+		if ip := net.ParseIP(h); ip != nil && ip.IsPrivate() {
+			callbackHost = h
+			bindAddr = "0.0.0.0"
+		}
+	}
+
 	// Start a local HTTP server on a random port to receive the callback.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", bindAddr+":0")
 	if err != nil {
 		return fmt.Errorf("failed to start local server: %w", err)
 	}
 	defer listener.Close()
 
 	port := listener.Addr().(*net.TCPAddr).Port
-	callbackURL := fmt.Sprintf("http://localhost:%d/callback", port)
+	callbackURL := fmt.Sprintf("http://%s:%d/callback", callbackHost, port)
 
 	// Generate a random state parameter for CSRF protection.
 	stateBytes := make([]byte, 16)
@@ -210,7 +218,6 @@ func runAuthLoginBrowser(cmd *cobra.Command) error {
 	profile := resolveProfile(cmd)
 	cfg, _ := cli.LoadCLIConfigForProfile(profile)
 	cfg.WorkspaceID = ""
-	cfg.WatchedWorkspaces = nil
 	cfg.Token = patResp.Token
 	cfg.ServerURL = serverURL
 	cfg.AppURL = appURL
@@ -253,7 +260,6 @@ func runAuthLoginToken(cmd *cobra.Command) error {
 	profile := resolveProfile(cmd)
 	cfg, _ := cli.LoadCLIConfigForProfile(profile)
 	cfg.WorkspaceID = ""
-	cfg.WatchedWorkspaces = nil
 	cfg.Token = token
 	cfg.ServerURL = serverURL
 	if err := cli.SaveCLIConfigForProfile(cfg, profile); err != nil {

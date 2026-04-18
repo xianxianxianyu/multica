@@ -8,10 +8,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -45,6 +44,12 @@ var daemonStatusCmd = &cobra.Command{
 	RunE:  runDaemonStatus,
 }
 
+var daemonRestartCmd = &cobra.Command{
+	Use:   "restart",
+	Short: "Restart the running daemon (stop + start)",
+	RunE:  runDaemonRestart,
+}
+
 var daemonLogsCmd = &cobra.Command{
 	Use:   "logs",
 	Short: "Show daemon logs",
@@ -67,8 +72,20 @@ func init() {
 
 	daemonStatusCmd.Flags().String("output", "table", "Output format: table or json")
 
+	// restart shares all the same flags as start
+	rf := daemonRestartCmd.Flags()
+	rf.Bool("foreground", false, "Run in the foreground instead of background")
+	rf.String("daemon-id", "", "Unique daemon identifier (env: MULTICA_DAEMON_ID)")
+	rf.String("device-name", "", "Human-readable device name (env: MULTICA_DAEMON_DEVICE_NAME)")
+	rf.String("runtime-name", "", "Runtime display name (env: MULTICA_AGENT_RUNTIME_NAME)")
+	rf.Duration("poll-interval", 0, "Task poll interval (env: MULTICA_DAEMON_POLL_INTERVAL)")
+	rf.Duration("heartbeat-interval", 0, "Heartbeat interval (env: MULTICA_DAEMON_HEARTBEAT_INTERVAL)")
+	rf.Duration("agent-timeout", 0, "Per-task timeout (env: MULTICA_AGENT_TIMEOUT)")
+	rf.Int("max-concurrent-tasks", 0, "Max tasks running in parallel (env: MULTICA_DAEMON_MAX_CONCURRENT_TASKS)")
+
 	daemonCmd.AddCommand(daemonStartCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
+	daemonCmd.AddCommand(daemonRestartCmd)
 	daemonCmd.AddCommand(daemonStatusCmd)
 	daemonCmd.AddCommand(daemonLogsCmd)
 }
@@ -84,11 +101,11 @@ func daemonDirForProfile(profile string) string {
 }
 
 func daemonPIDPathForProfile(profile string) string {
-	return daemonDirForProfile(profile) + "/daemon.pid"
+	return filepath.Join(daemonDirForProfile(profile), "daemon.pid")
 }
 
 func daemonLogPathForProfile(profile string) string {
-	return daemonDirForProfile(profile) + "/daemon.log"
+	return filepath.Join(daemonDirForProfile(profile), "daemon.log")
 }
 
 // healthPortForProfile returns the health check port for the given profile.
@@ -129,7 +146,8 @@ func runDaemonBackground(cmd *cobra.Command) error {
 		if profile != "" {
 			label = fmt.Sprintf("daemon [%s]", profile)
 		}
-		return fmt.Errorf("%s is already running (pid %v)", label, health["pid"])
+		pid, _ := health["pid"].(float64)
+		return fmt.Errorf("%s is already running (pid %v). Use 'daemon restart' to restart it", label, int(pid))
 	}
 
 	// Resolve current executable.
@@ -156,7 +174,7 @@ func runDaemonBackground(cmd *cobra.Command) error {
 	child := exec.Command(exePath, args...)
 	child.Stdout = logFile
 	child.Stderr = logFile
-	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	child.SysProcAttr = daemonSysProcAttr()
 
 	if err := child.Start(); err != nil {
 		logFile.Close()
@@ -174,12 +192,20 @@ func runDaemonBackground(cmd *cobra.Command) error {
 		fmt.Fprintf(os.Stderr, "Warning: could not write PID file: %v\n", err)
 	}
 
-	// Wait briefly and verify daemon started via health endpoint.
-	time.Sleep(2 * time.Second)
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel2()
-	health = checkDaemonHealthOnPort(ctx2, healthPort)
-	if health["status"] != "running" {
+	// Poll health endpoint until the daemon is ready or timeout.
+	deadline := time.Now().Add(15 * time.Second)
+	started := false
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		hctx, hcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		health = checkDaemonHealthOnPort(hctx, healthPort)
+		hcancel()
+		if health["status"] == "running" {
+			started = true
+			break
+		}
+	}
+	if !started {
 		fmt.Fprintf(os.Stderr, "Daemon may not have started successfully. Check logs:\n  %s\n", logPath)
 		return nil
 	}
@@ -265,8 +291,11 @@ func runDaemonForeground(cmd *cobra.Command) error {
 		return err
 	}
 	cfg.CLIVersion = version
+	// Set by the Electron Desktop app when it spawns the CLI so the server
+	// can mark those runtimes as "managed" and hide CLI self-update UI.
+	cfg.LaunchedBy = os.Getenv("MULTICA_LAUNCHED_BY")
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := notifyShutdownContext(context.Background())
 	defer stop()
 
 	logger := logger_pkg.NewLogger("daemon")
@@ -298,7 +327,7 @@ func runDaemonForeground(cmd *cobra.Command) error {
 		}
 		child.Stdout = logFile
 		child.Stderr = logFile
-		child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		child.SysProcAttr = daemonSysProcAttr()
 
 		if err := child.Start(); err != nil {
 			logFile.Close()
@@ -316,6 +345,39 @@ func runDaemonForeground(cmd *cobra.Command) error {
 	}
 
 	return nil
+}
+
+// --- daemon restart ---
+
+func runDaemonRestart(cmd *cobra.Command, args []string) error {
+	profile := resolveProfile(cmd)
+	healthPort := healthPortForProfile(profile)
+
+	// Stop if running.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	health := checkDaemonHealthOnPort(ctx, healthPort)
+	if health["status"] == "running" {
+		pid, _ := health["pid"].(float64)
+		if pid > 0 {
+			if p, err := os.FindProcess(int(pid)); err == nil {
+				fmt.Fprintf(os.Stderr, "Stopping daemon (pid %d)...\n", int(pid))
+				_ = stopDaemonProcess(p)
+				for i := 0; i < 10; i++ {
+					time.Sleep(500 * time.Millisecond)
+					sctx, scancel := context.WithTimeout(context.Background(), 1*time.Second)
+					h := checkDaemonHealthOnPort(sctx, healthPort)
+					scancel()
+					if h["status"] != "running" {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Start fresh.
+	return runDaemonStart(cmd, args)
 }
 
 // --- daemon stop ---
@@ -347,7 +409,7 @@ func runDaemonStop(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("find process %d: %w", int(pid), err)
 	}
 
-	if err := process.Signal(syscall.SIGTERM); err != nil {
+	if err := stopDaemonProcess(process); err != nil {
 		return fmt.Errorf("stop daemon (pid %d): %w", int(pid), err)
 	}
 
@@ -422,16 +484,7 @@ func runDaemonLogs(cmd *cobra.Command, _ []string) error {
 	follow, _ := cmd.Flags().GetBool("follow")
 	lines, _ := cmd.Flags().GetInt("lines")
 
-	args := []string{"-n", strconv.Itoa(lines)}
-	if follow {
-		args = append(args, "-f")
-	}
-	args = append(args, logPath)
-
-	tail := exec.Command("tail", args...)
-	tail.Stdout = os.Stdout
-	tail.Stderr = os.Stderr
-	return tail.Run()
+	return tailLogFile(logPath, lines, follow)
 }
 
 // checkDaemonHealthOnPort calls the daemon's local health endpoint on the given port.

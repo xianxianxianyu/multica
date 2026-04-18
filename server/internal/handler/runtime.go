@@ -59,16 +59,6 @@ func runtimeToResponse(rt db.AgentRuntime) AgentRuntimeResponse {
 // Runtime Usage
 // ---------------------------------------------------------------------------
 
-type RuntimeUsageEntry struct {
-	Date             string `json:"date"`
-	Provider         string `json:"provider"`
-	Model            string `json:"model"`
-	InputTokens      int64  `json:"input_tokens"`
-	OutputTokens     int64  `json:"output_tokens"`
-	CacheReadTokens  int64  `json:"cache_read_tokens"`
-	CacheWriteTokens int64  `json:"cache_write_tokens"`
-}
-
 type RuntimeUsageResponse struct {
 	RuntimeID        string `json:"runtime_id"`
 	Date             string `json:"date"`
@@ -80,43 +70,10 @@ type RuntimeUsageResponse struct {
 	CacheWriteTokens int64  `json:"cache_write_tokens"`
 }
 
-// ReportRuntimeUsage receives usage data from the daemon (unauthenticated daemon route).
-func (h *Handler) ReportRuntimeUsage(w http.ResponseWriter, r *http.Request) {
-	runtimeID := chi.URLParam(r, "runtimeId")
-	if runtimeID == "" {
-		writeError(w, http.StatusBadRequest, "runtimeId is required")
-		return
-	}
-
-	var req struct {
-		Entries []RuntimeUsageEntry `json:"entries"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	for _, entry := range req.Entries {
-		date, err := time.Parse("2006-01-02", entry.Date)
-		if err != nil {
-			continue
-		}
-		h.Queries.UpsertRuntimeUsage(r.Context(), db.UpsertRuntimeUsageParams{
-			RuntimeID:        parseUUID(runtimeID),
-			Date:             pgtype.Date{Time: date, Valid: true},
-			Provider:         entry.Provider,
-			Model:            entry.Model,
-			InputTokens:      entry.InputTokens,
-			OutputTokens:     entry.OutputTokens,
-			CacheReadTokens:  entry.CacheReadTokens,
-			CacheWriteTokens: entry.CacheWriteTokens,
-		})
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// GetRuntimeUsage returns usage data for a runtime (protected route).
+// GetRuntimeUsage returns daily token usage for a runtime, aggregated from
+// per-task usage records captured by the daemon. This is scoped to
+// Daemon-executed tasks only (i.e. excludes users' local CLI usage of the
+// same tool).
 func (h *Handler) GetRuntimeUsage(w http.ResponseWriter, r *http.Request) {
 	runtimeID := chi.URLParam(r, "runtimeId")
 
@@ -130,16 +87,11 @@ func (h *Handler) GetRuntimeUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := int32(90)
-	if l := r.URL.Query().Get("days"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 365 {
-			limit = int32(parsed)
-		}
-	}
+	since := parseSinceParam(r, 90)
 
 	rows, err := h.Queries.ListRuntimeUsage(r.Context(), db.ListRuntimeUsageParams{
 		RuntimeID: parseUUID(runtimeID),
-		Limit:     limit,
+		Since:     since,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list usage")
@@ -198,7 +150,7 @@ func (h *Handler) GetRuntimeTaskActivity(w http.ResponseWriter, r *http.Request)
 
 // GetWorkspaceUsageByDay returns daily token usage aggregated by model for the workspace.
 func (h *Handler) GetWorkspaceUsageByDay(w http.ResponseWriter, r *http.Request) {
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	since := parseSinceParam(r, 30)
 
 	rows, err := h.Queries.GetWorkspaceUsageByDay(r.Context(), db.GetWorkspaceUsageByDayParams{
@@ -238,7 +190,7 @@ func (h *Handler) GetWorkspaceUsageByDay(w http.ResponseWriter, r *http.Request)
 
 // GetWorkspaceUsageSummary returns total token usage aggregated by model for the workspace.
 func (h *Handler) GetWorkspaceUsageSummary(w http.ResponseWriter, r *http.Request) {
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	since := parseSinceParam(r, 30)
 
 	rows, err := h.Queries.GetWorkspaceUsageSummary(r.Context(), db.GetWorkspaceUsageSummaryParams{
@@ -287,7 +239,7 @@ func parseSinceParam(r *http.Request, defaultDays int) pgtype.Timestamptz {
 }
 
 func (h *Handler) ListAgentRuntimes(w http.ResponseWriter, r *http.Request) {
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 
 	var runtimes []db.AgentRuntime
 	var err error

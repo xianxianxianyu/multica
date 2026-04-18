@@ -147,6 +147,13 @@ func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UU
 // so frontends can update immediately.
 func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
 	task, err := s.Queries.CancelAgentTask(ctx, taskID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, err := s.Queries.GetAgentTask(ctx, taskID)
+		if err != nil {
+			return nil, fmt.Errorf("cancel task: %w", err)
+		}
+		return &existing, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cancel task: %w", err)
 	}
@@ -268,15 +275,23 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 
 	slog.Info("task completed", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(task.IssueID))
 
-	// Post agent output as a comment, but only for issue tasks with assignment triggers.
+	// Post agent output as a comment, but only for assignment-triggered issue tasks
+	// where the agent did NOT already post a comment during execution.
 	// Comment-triggered tasks: the agent replies via CLI with --parent, so
 	// posting here would create a duplicate.
 	// Chat tasks: no comment posting needed.
 	if task.IssueID.Valid && !task.TriggerCommentID.Valid {
-		var payload protocol.TaskCompletedPayload
-		if err := json.Unmarshal(result, &payload); err == nil {
-			if payload.Output != "" {
-				s.createAgentComment(ctx, task.IssueID, task.AgentID, redact.Text(payload.Output), "comment", task.TriggerCommentID)
+		agentCommented, _ := s.Queries.HasAgentCommentedSince(ctx, db.HasAgentCommentedSinceParams{
+			IssueID:  task.IssueID,
+			AuthorID: task.AgentID,
+			Since:    task.StartedAt,
+		})
+		if !agentCommented {
+			var payload protocol.TaskCompletedPayload
+			if err := json.Unmarshal(result, &payload); err == nil {
+				if payload.Output != "" {
+					s.createAgentComment(ctx, task.IssueID, task.AgentID, redact.Text(payload.Output), "comment", task.TriggerCommentID)
+				}
 			}
 		}
 	}
@@ -292,6 +307,14 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 				TaskID:        task.ID,
 			}); err != nil {
 				slog.Error("failed to save assistant chat message", "task_id", util.UUIDToString(task.ID), "error", err)
+			} else {
+				// Event-driven unread: stamp unread_since on the first unread
+				// assistant message. No-op if the session already has unread.
+				// If the user is actively viewing the session, the frontend's
+				// auto-mark-read effect will clear this within a tick.
+				if err := s.Queries.SetUnreadSinceIfNull(ctx, task.ChatSessionID); err != nil {
+					slog.Warn("failed to set unread_since", "chat_session_id", util.UUIDToString(task.ChatSessionID), "error", err)
+				}
 			}
 		}
 		s.Queries.UpdateChatSessionSession(ctx, db.UpdateChatSessionSessionParams{
@@ -453,8 +476,10 @@ func (s *TaskService) broadcastTaskDispatch(ctx context.Context, task db.AgentTa
 	}
 	payload["task_id"] = util.UUIDToString(task.ID)
 	payload["runtime_id"] = util.UUIDToString(task.RuntimeID)
+	payload["issue_id"] = util.UUIDToString(task.IssueID)
+	payload["agent_id"] = util.UUIDToString(task.AgentID)
 
-	workspaceID := s.resolveTaskWorkspaceID(ctx, task)
+	workspaceID := s.ResolveTaskWorkspaceID(ctx, task)
 	if workspaceID == "" {
 		return
 	}
@@ -468,7 +493,7 @@ func (s *TaskService) broadcastTaskDispatch(ctx context.Context, task db.AgentTa
 }
 
 func (s *TaskService) broadcastTaskEvent(ctx context.Context, eventType string, task db.AgentTaskQueue) {
-	workspaceID := s.resolveTaskWorkspaceID(ctx, task)
+	workspaceID := s.ResolveTaskWorkspaceID(ctx, task)
 	if workspaceID == "" {
 		return
 	}
@@ -490,9 +515,11 @@ func (s *TaskService) broadcastTaskEvent(ctx context.Context, eventType string, 
 	})
 }
 
-// resolveTaskWorkspaceID determines the workspace ID for a task.
+// ResolveTaskWorkspaceID determines the workspace ID for a task.
 // For issue tasks, it comes from the issue. For chat tasks, from the chat session.
-func (s *TaskService) resolveTaskWorkspaceID(ctx context.Context, task db.AgentTaskQueue) string {
+// For autopilot tasks, from the autopilot via its run.
+// Returns "" when none of the links resolve — callers treat that as "not found".
+func (s *TaskService) ResolveTaskWorkspaceID(ctx context.Context, task db.AgentTaskQueue) string {
 	if task.IssueID.Valid {
 		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
 			return util.UUIDToString(issue.WorkspaceID)
@@ -503,11 +530,18 @@ func (s *TaskService) resolveTaskWorkspaceID(ctx context.Context, task db.AgentT
 			return util.UUIDToString(cs.WorkspaceID)
 		}
 	}
+	if task.AutopilotRunID.Valid {
+		if run, err := s.Queries.GetAutopilotRun(ctx, task.AutopilotRunID); err == nil {
+			if ap, err := s.Queries.GetAutopilot(ctx, run.AutopilotID); err == nil {
+				return util.UUIDToString(ap.WorkspaceID)
+			}
+		}
+	}
 	return ""
 }
 
 func (s *TaskService) broadcastChatDone(ctx context.Context, task db.AgentTaskQueue) {
-	workspaceID := s.resolveTaskWorkspaceID(ctx, task)
+	workspaceID := s.ResolveTaskWorkspaceID(ctx, task)
 	if workspaceID == "" {
 		return
 	}
@@ -551,15 +585,23 @@ func (s *TaskService) createAgentComment(ctx context.Context, issueID, agentID p
 	if err != nil {
 		return
 	}
+	// Resolve thread root: if parentID points to a reply (has its own parent),
+	// use that parent instead so the comment lands in the top-level thread.
+	if parentID.Valid {
+		if parent, err := s.Queries.GetComment(ctx, parentID); err == nil && parent.ParentID.Valid {
+			parentID = parent.ParentID
+		}
+	}
 	// Expand bare issue identifiers (e.g. MUL-117) into mention links.
 	content = mention.ExpandIssueIdentifiers(ctx, s.Queries, issue.WorkspaceID, content)
 	comment, err := s.Queries.CreateComment(ctx, db.CreateCommentParams{
-		IssueID:    issueID,
-		AuthorType: "agent",
-		AuthorID:   agentID,
-		Content:    content,
-		Type:       commentType,
-		ParentID:   parentID,
+		IssueID:     issueID,
+		WorkspaceID: issue.WorkspaceID,
+		AuthorType:  "agent",
+		AuthorID:    agentID,
+		Content:     content,
+		Type:        commentType,
+		ParentID:    parentID,
 	})
 	if err != nil {
 		return

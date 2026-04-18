@@ -14,11 +14,8 @@ import (
 )
 
 // APIClient is a REST client for the Multica server API.
-// Used by ctrl subcommands (agent, runtime, status, etc.).
-//
-// TODO: Add Authorization header support. Agent routes (/api/agents/...)
-// require JWT auth via middleware.Auth, but this client currently sends
-// no auth token. CLI agent commands will fail with 401 until this is added.
+// Used by ctrl subcommands (agent, runtime, status, etc.). Requests
+// automatically include auth and execution context headers when configured.
 type APIClient struct {
 	BaseURL     string
 	WorkspaceID string
@@ -179,6 +176,36 @@ func (c *APIClient) PutJSON(ctx context.Context, path string, body any, out any)
 	if resp.StatusCode >= 400 {
 		respData, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("PUT %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(respData)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// PatchJSON performs a PATCH request with a JSON body.
+func (c *APIClient) PatchJSON(ctx context.Context, path string, body any, out any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.BaseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.setHeaders(req)
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respData, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("PATCH %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(respData)))
 	}
 	if out == nil {
 		return nil

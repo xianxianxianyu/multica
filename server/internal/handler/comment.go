@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/mention"
+	"github.com/multica-ai/multica/server/internal/sanitize"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -218,6 +219,9 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 	// Expand bare issue identifiers (e.g. MUL-117) into mention links.
 	req.Content = mention.ExpandIssueIdentifiers(r.Context(), h.Queries, issue.WorkspaceID, req.Content)
 
+	// Sanitize HTML to prevent stored XSS.
+	req.Content = sanitize.HTML(req.Content)
+
 	comment, err := h.Queries.CreateComment(r.Context(), db.CreateCommentParams{
 		IssueID:     issue.ID,
 		WorkspaceID: issue.WorkspaceID,
@@ -258,7 +262,7 @@ func (h *Handler) CreateComment(w http.ResponseWriter, r *http.Request) {
 	// assignee — the user is continuing a member-to-member conversation.
 	if authorType == "member" && h.shouldEnqueueOnComment(r.Context(), issue) &&
 		!h.commentMentionsOthersButNotAssignee(comment.Content, issue) &&
-		!h.isReplyToMemberThread(parentComment, comment.Content, issue) {
+		!h.isReplyToMemberThread(r.Context(), parentComment, comment.Content, issue) {
 		// Resolve thread root: if the comment is a reply, agent should reply
 		// to the thread root (matching frontend behavior where all replies
 		// in a thread share the same top-level parent).
@@ -321,7 +325,9 @@ func (h *Handler) commentMentionsOthersButNotAssignee(content string, issue db.I
 // in the reply, still triggers on_comment as expected.
 // If the parent (thread root) itself @mentions the assignee, the thread is
 // considered a conversation with the agent, so replies are allowed to trigger.
-func (h *Handler) isReplyToMemberThread(parent *db.Comment, content string, issue db.Issue) bool {
+// If the assigned agent has already replied in the thread, the member is
+// conversing with the agent, so replies are allowed to trigger.
+func (h *Handler) isReplyToMemberThread(ctx context.Context, parent *db.Comment, content string, issue db.Issue) bool {
 	if parent == nil {
 		return false // Not a reply — normal top-level comment
 	}
@@ -329,7 +335,8 @@ func (h *Handler) isReplyToMemberThread(parent *db.Comment, content string, issu
 		return false // Thread started by an agent — allow trigger
 	}
 	// Thread was started by a member. Suppress on_comment unless the reply
-	// or the parent explicitly @mentions the assignee agent.
+	// or the parent explicitly @mentions the assignee agent, or the agent
+	// has already participated in this thread.
 	if !issue.AssigneeID.Valid {
 		return true // No assignee to mention
 	}
@@ -347,7 +354,18 @@ func (h *Handler) isReplyToMemberThread(parent *db.Comment, content string, issu
 			return false // Assignee mentioned in thread root — allow trigger
 		}
 	}
-	return true // Reply to member thread without mentioning agent — suppress
+	// Check if the assigned agent has already replied in this thread —
+	// if so, the member is continuing a conversation with the agent.
+	if h.Queries != nil {
+		hasReplied, err := h.Queries.HasAgentRepliedInThread(ctx, db.HasAgentRepliedInThreadParams{
+			ParentID: parent.ID,
+			AgentID:  issue.AssigneeID,
+		})
+		if err == nil && hasReplied {
+			return false // Agent participated in thread — allow trigger
+		}
+	}
+	return true // Reply to member thread without agent participation — suppress
 }
 
 // enqueueMentionedAgentTasks parses @agent mentions from comment content and
@@ -365,34 +383,13 @@ func (h *Handler) isReplyToMemberThread(parent *db.Comment, content string, issu
 func (h *Handler) enqueueMentionedAgentTasks(ctx context.Context, issue db.Issue, comment db.Comment, parentComment *db.Comment, authorType, authorID string) {
 	wsID := uuidToString(issue.WorkspaceID)
 	mentions := util.ParseMentions(comment.Content)
-	// When replying in a thread, also include mentions from the parent comment
-	// so that agents mentioned in the thread root are triggered by replies.
-	// However, skip inheritance when the reply explicitly @mentions only
-	// non-agent entities (members, issues) — the user is directing the reply
-	// at other people, not requesting work from agents in the parent thread.
-	if parentComment != nil {
-		hasAgentMention := false
-		hasNonAgentMention := false
-		for _, m := range mentions {
-			if m.Type == "agent" {
-				hasAgentMention = true
-			} else {
-				hasNonAgentMention = true
-			}
-		}
-		if hasAgentMention || !hasNonAgentMention {
-			parentMentions := util.ParseMentions(parentComment.Content)
-			seen := make(map[string]bool, len(mentions))
-			for _, m := range mentions {
-				seen[m.Type+":"+m.ID] = true
-			}
-			for _, m := range parentMentions {
-				if !seen[m.Type+":"+m.ID] {
-					mentions = append(mentions, m)
-					seen[m.Type+":"+m.ID] = true
-				}
-			}
-		}
+	// When replying in a thread, inherit mentions from the parent comment
+	// so that agents mentioned in the thread root are triggered by replies —
+	// but only when the reply contains no mentions at all (a plain follow-up).
+	// If the reply explicitly @mentions anyone (agents or members), the user
+	// is making a deliberate choice about who to involve; don't auto-inherit.
+	if parentComment != nil && len(mentions) == 0 {
+		mentions = util.ParseMentions(parentComment.Content)
 	}
 	for _, m := range mentions {
 		if m.Type != "agent" {
@@ -426,12 +423,9 @@ func (h *Handler) enqueueMentionedAgentTasks(ctx context.Context, issue db.Issue
 		if err != nil || hasPending {
 			continue
 		}
-		// Resolve thread root for reply threading.
-		replyTo := comment.ID
-		if comment.ParentID.Valid {
-			replyTo = comment.ParentID
-		}
-		if _, err := h.TaskService.EnqueueTaskForMention(ctx, issue, agentUUID, replyTo); err != nil {
+		// Always use the current comment as the trigger so the agent reads the
+		// actual reply that mentioned it, not the thread root.
+		if _, err := h.TaskService.EnqueueTaskForMention(ctx, issue, agentUUID, comment.ID); err != nil {
 			slog.Warn("enqueue mention agent task failed", "issue_id", uuidToString(issue.ID), "agent_id", m.ID, "error", err)
 		}
 	}
@@ -446,7 +440,7 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load comment scoped to current workspace.
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	existing, err := h.Queries.GetCommentInWorkspace(r.Context(), db.GetCommentInWorkspaceParams{
 		ID:          parseUUID(commentId),
 		WorkspaceID: parseUUID(workspaceID),
@@ -481,6 +475,9 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Sanitize HTML to prevent stored XSS.
+	req.Content = sanitize.HTML(req.Content)
+
 	comment, err := h.Queries.UpdateComment(r.Context(), db.UpdateCommentParams{
 		ID:      parseUUID(commentId),
 		Content: req.Content,
@@ -510,7 +507,7 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Load comment scoped to current workspace.
-	workspaceID := resolveWorkspaceID(r)
+	workspaceID := h.resolveWorkspaceID(r)
 	comment, err := h.Queries.GetCommentInWorkspace(r.Context(), db.GetCommentInWorkspaceParams{
 		ID:          parseUUID(commentId),
 		WorkspaceID: parseUUID(workspaceID),

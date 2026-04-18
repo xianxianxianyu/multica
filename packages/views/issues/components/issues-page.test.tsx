@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Issue } from "@multica/core/types";
-import { WorkspaceIdProvider } from "@multica/core/hooks";
+vi.mock("@multica/core/hooks", () => ({
+  useWorkspaceId: () => "ws-1",
+}));
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -22,27 +24,19 @@ vi.mock("@multica/core/auth", () => ({
   createAuthStore: vi.fn(),
 }));
 
-// Mock @multica/core/workspace
-vi.mock("@multica/core/workspace", () => ({
-  useWorkspaceStore: Object.assign(
-    (selector?: any) => {
-      const state = {
-        workspace: { id: "ws-1", name: "Test WS", slug: "test" },
-        agents: [],
-        members: [],
-      };
-      return selector ? selector(state) : state;
-    },
-    {
-      getState: () => ({
-        workspace: { id: "ws-1", name: "Test WS", slug: "test" },
-        agents: [],
-        members: [],
-      }),
-    },
-  ),
-  registerWorkspaceStore: vi.fn(),
-}));
+// Mock @multica/core/paths — after the URL-driven workspace refactor,
+// useCurrentWorkspace derives from the workspace slug in URL Context. Tests
+// don't mount a real route, so we short-circuit to a fixed fixture.
+vi.mock("@multica/core/paths", async () => {
+  const actual = await vi.importActual<typeof import("@multica/core/paths")>(
+    "@multica/core/paths",
+  );
+  return {
+    ...actual,
+    useCurrentWorkspace: () => ({ id: "ws-1", name: "Test WS", slug: "test" }),
+    useWorkspacePaths: () => actual.paths.workspace("test"),
+  };
+});
 
 // Mock @multica/views/navigation (AppLink + useNavigation)
 vi.mock("../../navigation", () => ({
@@ -110,9 +104,11 @@ const mockViewState = {
   assigneeFilters: [] as { type: string; id: string }[],
   includeNoAssignee: false,
   creatorFilters: [] as { type: string; id: string }[],
+  projectFilters: [] as string[],
+  includeNoProject: false,
   sortBy: "position" as const,
   sortDirection: "asc" as const,
-  cardProperties: { priority: true, description: true, assignee: true, dueDate: true },
+  cardProperties: { priority: true, description: true, assignee: true, dueDate: true, project: true, childProgress: true },
   listCollapsedStatuses: [] as string[],
   setViewMode: vi.fn(),
   toggleStatusFilter: vi.fn(),
@@ -120,6 +116,8 @@ const mockViewState = {
   toggleAssigneeFilter: vi.fn(),
   toggleNoAssignee: vi.fn(),
   toggleCreatorFilter: vi.fn(),
+  toggleProjectFilter: vi.fn(),
+  toggleNoProject: vi.fn(),
   hideStatus: vi.fn(),
   showStatus: vi.fn(),
   clearFilters: vi.fn(),
@@ -130,7 +128,9 @@ const mockViewState = {
 };
 
 vi.mock("@multica/core/issues/stores/view-store", () => ({
-  initFilterWorkspaceSync: vi.fn(),
+  useClearFiltersOnWorkspaceChange: () => {},
+  viewStorePersistOptions: () => ({ name: "test", storage: undefined, partialize: (s: any) => s }),
+  viewStoreSlice: vi.fn(),
   useIssueViewStore: Object.assign(
     (selector?: any) => (selector ? selector(mockViewState) : mockViewState),
     { getState: () => mockViewState, setState: vi.fn() },
@@ -152,6 +152,8 @@ vi.mock("@multica/core/issues/stores/view-store", () => ({
     { key: "description", label: "Description" },
     { key: "assignee", label: "Assignee" },
     { key: "dueDate", label: "Due date" },
+    { key: "project", label: "Project" },
+    { key: "childProgress", label: "Sub-issue progress" },
   ],
 }));
 
@@ -178,6 +180,16 @@ vi.mock("@multica/core/issues/stores/selection-store", () => ({
       return selector ? selector(state) : state;
     },
     { getState: () => ({ selectedIds: new Set(), toggle: vi.fn(), clear: vi.fn(), setAll: vi.fn() }) },
+  ),
+}));
+
+vi.mock("@multica/core/issues/stores/recent-issues-store", () => ({
+  useRecentIssuesStore: Object.assign(
+    (selector?: any) => {
+      const state = { items: [], recordVisit: vi.fn() };
+      return selector ? selector(state) : state;
+    },
+    { getState: () => ({ items: [], recordVisit: vi.fn() }) },
   ),
 }));
 
@@ -323,7 +335,7 @@ function renderWithQuery(ui: React.ReactElement) {
   });
   return render(
     <QueryClientProvider client={qc}>
-      <WorkspaceIdProvider wsId="ws-1">{ui}</WorkspaceIdProvider>
+      {ui}
     </QueryClientProvider>,
   );
 }

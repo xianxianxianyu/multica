@@ -44,5 +44,21 @@ UPDATE comment SET
 WHERE id = $1
 RETURNING *;
 
+-- name: HasAgentCommentedSince :one
+SELECT EXISTS (
+    SELECT 1 FROM comment
+    WHERE issue_id = @issue_id
+      AND author_type = 'agent'
+      AND author_id = @author_id
+      AND created_at >= @since
+) AS commented;
+
+-- name: HasAgentRepliedInThread :one
+-- Returns true if the given agent has posted a reply in the thread rooted at
+-- the specified parent comment. Used to detect agent participation in a
+-- member-started thread so that follow-up member replies still trigger the agent.
+SELECT count(*) > 0 AS has_replied FROM comment
+WHERE parent_id = @parent_id AND author_type = 'agent' AND author_id = @agent_id;
+
 -- name: DeleteComment :exec
 DELETE FROM comment WHERE id = $1;

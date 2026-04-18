@@ -30,15 +30,32 @@ import {
   useEffect,
   useImperativeHandle,
   useRef,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import { cn } from "@multica/ui/lib/utils";
 import type { UploadResult } from "@multica/core/hooks/use-file-upload";
+import { useWorkspaceSlug } from "@multica/core/paths";
 import { useQueryClient } from "@tanstack/react-query";
 import { createEditorExtensions } from "./extensions";
 import { uploadAndInsertFile } from "./extensions/file-upload";
 import { preprocessMarkdown } from "./utils/preprocess";
+import { openLink, isMentionHref } from "./utils/link-handler";
+import { EditorBubbleMenu } from "./bubble-menu";
+import { useLinkHover, LinkHoverCard } from "./link-hover-card";
 import "./content-editor.css";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Blob URLs (blob:http://…) are process-local and expire on reload. Strip them
+ *  from serialised markdown so they never reach the database. */
+const BLOB_IMAGE_RE = /!\[[^\]]*\]\(blob:[^)]*\)\n?/g;
+
+function stripBlobUrls(md: string): string {
+  return md.replace(BLOB_IMAGE_RE, "");
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,6 +71,10 @@ interface ContentEditorProps {
   onSubmit?: () => void;
   onBlur?: () => void;
   onUploadFile?: (file: File) => Promise<UploadResult | null>;
+  /** Show the floating formatting toolbar on text selection. Defaults true. */
+  showBubbleMenu?: boolean;
+  /** When true, bare Enter submits (chat-style). Mod-Enter always submits. */
+  submitOnEnter?: boolean;
 }
 
 interface ContentEditorRef {
@@ -61,6 +82,8 @@ interface ContentEditorRef {
   clearContent: () => void;
   focus: () => void;
   uploadFile: (file: File) => void;
+  /** True when file uploads are still in progress. */
+  hasActiveUploads: () => boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +102,8 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
       onSubmit,
       onBlur,
       onUploadFile,
+      showBubbleMenu = true,
+      submitOnEnter = false,
     },
     ref,
   ) {
@@ -88,6 +113,14 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     const onBlurRef = useRef(onBlur);
     const onUploadFileRef = useRef(onUploadFile);
     const prevContentRef = useRef(defaultValue);
+    const lastEmittedRef = useRef<string | null>(null);
+
+    // Current workspace slug kept in a ref so the click handler always sees the
+    // latest value without recreating the editor. Used by openLink to prefix
+    // legacy /issues/... style paths that lack a workspace slug.
+    const workspaceSlug = useWorkspaceSlug();
+    const workspaceSlugRef = useRef(workspaceSlug);
+    workspaceSlugRef.current = workspaceSlug;
 
     // Keep refs in sync without recreating editor
     onUpdateRef.current = onUpdate;
@@ -99,7 +132,13 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
 
     const editor = useEditor({
       immediatelyRender: false,
+      // Note: in v3.22.1 the default is already false/undefined (same behavior).
+      // Explicit for clarity — the real perf win is useEditorState in BubbleMenu.
+      shouldRerenderOnTransaction: false,
       editable,
+      onCreate: ({ editor: ed }) => {
+        lastEmittedRef.current = stripBlobUrls(ed.getMarkdown());
+      },
       content: defaultValue ? preprocessMarkdown(defaultValue) : "",
       contentType: defaultValue ? "markdown" : undefined,
       extensions: createEditorExtensions({
@@ -108,12 +147,16 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
         queryClient,
         onSubmitRef,
         onUploadFileRef,
+        submitOnEnter,
       }),
       onUpdate: ({ editor: ed }) => {
         if (!onUpdateRef.current) return;
         if (debounceRef.current) clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => {
-          onUpdateRef.current?.(ed.getMarkdown());
+          const md = stripBlobUrls(ed.getMarkdown());
+          if (md === lastEmittedRef.current) return;
+          lastEmittedRef.current = md;
+          onUpdateRef.current?.(md);
         }, debounceMs);
       },
       onBlur: () => {
@@ -128,35 +171,11 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
 
             const link = target.closest("a");
             const href = link?.getAttribute("href");
-            if (!href || href.startsWith("mention://")) return false;
+            if (!href || isMentionHref(href)) return false;
 
-            const openLink = () => {
-              if (href.startsWith("/")) {
-                // Internal path — dispatch custom event so the app can handle it
-                // (direct window.open breaks in Electron hash router)
-                window.dispatchEvent(
-                  new CustomEvent("multica:navigate", { detail: { path: href } }),
-                );
-              } else {
-                window.open(href, "_blank", "noopener,noreferrer");
-              }
-            };
-
-            if (!editable) {
-              // Readonly: any click on link opens new tab
-              event.preventDefault();
-              openLink();
-              return true;
-            }
-
-            if (event.metaKey || event.ctrlKey) {
-              // Edit mode: Cmd/Ctrl+click opens link
-              event.preventDefault();
-              openLink();
-              return true;
-            }
-
-            return false;
+            event.preventDefault();
+            openLink(href, workspaceSlugRef.current);
+            return true;
           },
         },
         attributes: {
@@ -191,7 +210,7 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
     }, [editor, editable, defaultValue]);
 
     useImperativeHandle(ref, () => ({
-      getMarkdown: () => editor?.getMarkdown() ?? "",
+      getMarkdown: () => stripBlobUrls(editor?.getMarkdown() ?? ""),
       clearContent: () => {
         editor?.commands.clearContent();
       },
@@ -203,13 +222,44 @@ const ContentEditor = forwardRef<ContentEditorRef, ContentEditorProps>(
         const endPos = editor.state.doc.content.size;
         uploadAndInsertFile(editor, file, onUploadFileRef.current, endPos);
       },
+      hasActiveUploads: () => {
+        if (!editor) return false;
+        let uploading = false;
+        editor.state.doc.descendants((node) => {
+          if (node.attrs.uploading) uploading = true;
+          return !uploading;
+        });
+        return uploading;
+      },
     }));
+
+    // Link hover card — disabled when BubbleMenu is active (has selection)
+    const wrapperRef = useRef<HTMLDivElement>(null);
+    const hoverDisabled = !editor?.state.selection.empty;
+    const hover = useLinkHover(wrapperRef, hoverDisabled);
+
+    const handleContainerMouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
+      if (!editable || !editor) return;
+
+      const target = event.target as HTMLElement;
+      if (target.closest(".ProseMirror")) return;
+      if (target.closest("a, button, input, textarea, [role='button'], [data-node-view-wrapper]")) return;
+
+      event.preventDefault();
+      editor.commands.focus("end");
+    };
 
     if (!editor) return null;
 
     return (
-      <div className="relative min-h-full">
-        <EditorContent editor={editor} />
+      <div
+        ref={wrapperRef}
+        className="relative flex min-h-full flex-col"
+        onMouseDown={handleContainerMouseDown}
+      >
+        <EditorContent className="flex-1 min-h-full" editor={editor} />
+        {editable && showBubbleMenu && <EditorBubbleMenu editor={editor} />}
+        <LinkHoverCard {...hover} />
       </div>
     );
   },

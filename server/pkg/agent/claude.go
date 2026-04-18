@@ -34,9 +34,33 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 
-	args := buildClaudeArgs(opts)
+	args := buildClaudeArgs(opts, b.cfg.Logger)
+
+	// If the caller provided an MCP config, write it to a temp file and pass
+	// --mcp-config <path> so the agent uses a controlled set of MCP servers
+	// instead of inheriting from the outer Claude Code session.
+	var mcpConfigPath string
+	var mcpFileCleanup func() // non-nil while this function owns the temp file
+	if len(opts.McpConfig) > 0 {
+		path, err := writeMcpConfigToTemp(opts.McpConfig)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		mcpConfigPath = path
+		mcpFileCleanup = func() { os.Remove(mcpConfigPath) }
+		args = append(args, "--mcp-config", mcpConfigPath)
+	}
+	// Clean up the temp file if we return before the goroutine takes ownership.
+	defer func() {
+		if mcpFileCleanup != nil {
+			mcpFileCleanup()
+		}
+	}()
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
+	b.cfg.Logger.Debug("agent command", "exec", execPath, "args", args)
+	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -52,25 +76,31 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		cancel()
 		return nil, fmt.Errorf("claude stdin pipe: %w", err)
 	}
+	closeStdin := func() {
+		if stdin != nil {
+			_ = stdin.Close()
+			stdin = nil
+		}
+	}
 	cmd.Stderr = newLogWriter(b.cfg.Logger, "[claude:stderr] ")
 
 	if err := cmd.Start(); err != nil {
+		closeStdin()
 		cancel()
 		return nil, fmt.Errorf("start claude: %w", err)
 	}
 	if err := writeClaudeInput(stdin, prompt); err != nil {
-		_ = stdin.Close()
+		closeStdin()
 		cancel()
 		_ = cmd.Wait()
 		return nil, fmt.Errorf("write claude input: %w", err)
 	}
-	if err := stdin.Close(); err != nil {
-		cancel()
-		_ = cmd.Wait()
-		return nil, fmt.Errorf("close claude stdin: %w", err)
-	}
+	closeStdin()
 
 	b.cfg.Logger.Info("claude started", "pid", cmd.Process.Pid, "cwd", opts.Cwd, "model", opts.Model)
+
+	// cmd.Start() succeeded — transfer temp file ownership to the goroutine.
+	mcpFileCleanup = nil
 
 	msgCh := make(chan Message, 256)
 	resCh := make(chan Result, 1)
@@ -79,6 +109,9 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		defer cancel()
 		defer close(msgCh)
 		defer close(resCh)
+		if mcpConfigPath != "" {
+			defer os.Remove(mcpConfigPath)
+		}
 
 		startTime := time.Now()
 		var output strings.Builder
@@ -86,6 +119,12 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		finalStatus := "completed"
 		var finalError string
 		usage := make(map[string]TokenUsage)
+
+		// Close stdout when the context is cancelled so scanner.Scan() unblocks.
+		go func() {
+			<-runCtx.Done()
+			_ = stdout.Close()
+		}()
 
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
@@ -112,6 +151,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				}
 				trySend(msgCh, Message{Type: MessageStatus, Status: "running"})
 			case "result":
+				closeStdin()
 				sessionID = msg.SessionID
 				if msg.ResultText != "" {
 					output.Reset()
@@ -331,7 +371,18 @@ func trySend(ch chan<- Message, msg Message) {
 	}
 }
 
-func buildClaudeArgs(opts ExecOptions) []string {
+// claudeBlockedArgs are flags hardcoded by the daemon that must not be
+// overridden by user-configured custom_args. Overriding these would break
+// the daemon↔Claude communication protocol.
+var claudeBlockedArgs = map[string]blockedArgMode{
+	"-p":                blockedStandalone, // non-interactive mode
+	"--output-format":   blockedWithValue,  // stream-json protocol
+	"--input-format":    blockedWithValue,  // stream-json protocol
+	"--permission-mode": blockedWithValue,  // bypassPermissions for autonomous operation
+	"--mcp-config":      blockedWithValue,  // set by daemon from agent.mcp_config
+}
+
+func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -352,6 +403,7 @@ func buildClaudeArgs(opts ExecOptions) []string {
 	if opts.ResumeSessionID != "" {
 		args = append(args, "--resume", opts.ResumeSessionID)
 	}
+	args = append(args, filterCustomArgs(opts.CustomArgs, claudeBlockedArgs, logger)...)
 	return args
 }
 
@@ -409,6 +461,71 @@ func isFilteredChildEnvKey(key string) bool {
 	return key == "CLAUDECODE" ||
 		strings.HasPrefix(key, "CLAUDECODE_") ||
 		strings.HasPrefix(key, "CLAUDE_CODE_")
+}
+
+// blockedArgMode specifies whether a blocked arg takes a value or is standalone.
+type blockedArgMode int
+
+const (
+	blockedWithValue  blockedArgMode = iota // flag takes a value (next arg or =value)
+	blockedStandalone                       // flag is boolean, no value
+)
+
+// filterCustomArgs removes protocol-critical flags from user-configured custom
+// args to prevent breaking daemon↔agent communication. Each backend defines its
+// own blocked set (the flags it hardcodes). This is intentionally narrow — we
+// only block args that would break the communication protocol, not every
+// possible dangerous flag. Workspace members are trusted to configure agents
+// sensibly, same as with custom_env.
+func filterCustomArgs(args []string, blocked map[string]blockedArgMode, logger *slog.Logger) []string {
+	if len(args) == 0 {
+		return args
+	}
+	filtered := make([]string, 0, len(args))
+	skip := false
+	for _, arg := range args {
+		if skip {
+			skip = false
+			continue
+		}
+		// Check if this arg is a blocked flag or starts with "blockedFlag=".
+		flag := arg
+		hasInlineValue := false
+		if idx := strings.Index(arg, "="); idx > 0 {
+			flag = arg[:idx]
+			hasInlineValue = true
+		}
+		mode, isBlocked := blocked[flag]
+		if isBlocked {
+			logger.Warn("custom_args: blocked protocol-critical flag, skipping", "flag", flag)
+			if mode == blockedWithValue && !hasInlineValue {
+				// The next arg is the value for this flag — skip it too.
+				skip = true
+			}
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	return filtered
+}
+
+// writeMcpConfigToTemp writes raw MCP config JSON to a temporary file and returns
+// its path. The caller is responsible for removing the file when done.
+func writeMcpConfigToTemp(raw json.RawMessage) (string, error) {
+	f, err := os.CreateTemp("", "multica-mcp-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create mcp config temp file: %w", err)
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", fmt.Errorf("write mcp config temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("close mcp config temp file: %w", err)
+	}
+	return f.Name(), nil
 }
 
 func detectCLIVersion(ctx context.Context, execPath string) (string, error) {

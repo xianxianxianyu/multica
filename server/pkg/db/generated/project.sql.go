@@ -133,6 +133,41 @@ func (q *Queries) GetProjectInWorkspace(ctx context.Context, arg GetProjectInWor
 	return i, err
 }
 
+const getProjectIssueStats = `-- name: GetProjectIssueStats :many
+SELECT project_id,
+       count(*)::bigint AS total_count,
+       count(*) FILTER (WHERE status IN ('done', 'cancelled'))::bigint AS done_count
+FROM issue
+WHERE project_id = ANY($1::uuid[])
+GROUP BY project_id
+`
+
+type GetProjectIssueStatsRow struct {
+	ProjectID  pgtype.UUID `json:"project_id"`
+	TotalCount int64       `json:"total_count"`
+	DoneCount  int64       `json:"done_count"`
+}
+
+func (q *Queries) GetProjectIssueStats(ctx context.Context, projectIds []pgtype.UUID) ([]GetProjectIssueStatsRow, error) {
+	rows, err := q.db.Query(ctx, getProjectIssueStats, projectIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetProjectIssueStatsRow{}
+	for rows.Next() {
+		var i GetProjectIssueStatsRow
+		if err := rows.Scan(&i.ProjectID, &i.TotalCount, &i.DoneCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listProjects = `-- name: ListProjects :many
 SELECT id, workspace_id, title, description, icon, status, lead_type, lead_id, created_at, updated_at, priority FROM project
 WHERE workspace_id = $1

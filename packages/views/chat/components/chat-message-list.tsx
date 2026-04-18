@@ -1,132 +1,167 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "@multica/ui/lib/utils";
-import { Avatar, AvatarFallback, AvatarImage } from "@multica/ui/components/ui/avatar";
+import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@multica/ui/components/ui/collapsible";
-import { Bot, Loader2, ChevronRight, ChevronDown, Brain, AlertCircle } from "lucide-react";
-import { api } from "@multica/core/api";
+import { Loader2, ChevronRight, ChevronDown, Brain, AlertCircle } from "lucide-react";
+import { useScrollFade } from "@multica/ui/hooks/use-scroll-fade";
+import { useAutoScroll } from "@multica/ui/hooks/use-auto-scroll";
+import { taskMessagesOptions } from "@multica/core/chat/queries";
 import { Markdown } from "@multica/views/common/markdown";
-import type { ChatMessage, Agent, TaskMessagePayload } from "@multica/core/types";
+import type { ChatMessage, TaskMessagePayload } from "@multica/core/types";
 import type { ChatTimelineItem } from "@multica/core/chat";
 
 // ─── Public component ────────────────────────────────────────────────────
 
 interface ChatMessageListProps {
   messages: ChatMessage[];
-  agent: Agent | null;
-  timelineItems: ChatTimelineItem[];
+  /** When set, streams the live timeline for this task from task-messages cache. */
+  pendingTaskId: string | null;
   isWaiting: boolean;
 }
 
 export function ChatMessageList({
   messages,
-  agent,
-  timelineItems,
+  pendingTaskId,
   isWaiting,
 }: ChatMessageListProps) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const fadeStyle = useScrollFade(scrollRef);
+  useAutoScroll(scrollRef);
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, timelineItems]);
+  // Once the assistant message for this pending task has landed in the
+  // messages list, AssistantMessage owns its rendering — suppress the live
+  // timeline to avoid rendering the same content in two places during the
+  // invalidate → refetch window.
+  const pendingAlreadyPersisted = !!pendingTaskId && messages.some(
+    (m) => m.role === "assistant" && m.task_id === pendingTaskId,
+  );
 
-  const hasTimeline = timelineItems.length > 0;
+  // Live timeline for the in-flight task. useRealtimeSync keeps this cache
+  // current via setQueryData on task:message events.
+  const showLiveTimeline = !!pendingTaskId && !pendingAlreadyPersisted;
+  const { data: liveTaskMessages } = useQuery({
+    ...taskMessagesOptions(pendingTaskId ?? ""),
+    enabled: showLiveTimeline,
+  });
+  const liveTimeline: ChatTimelineItem[] = (liveTaskMessages ?? []).map(toTimelineItem);
+  const hasLive = showLiveTimeline && liveTimeline.length > 0;
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
-      {messages.map((msg) => (
-        <MessageBubble key={msg.id} message={msg} agent={agent} />
-      ))}
-      {/* Live streaming timeline */}
-      {hasTimeline && (
-        <div className="flex items-start gap-3">
-          <AgentAvatar agent={agent} />
-          <div className="min-w-0 flex-1 space-y-1.5">
-            <TimelineView items={timelineItems} />
+    <div ref={scrollRef} style={fadeStyle} className="flex-1 overflow-y-auto">
+      {/* Inner container matches issue / project detail width convention
+       *  (max-w-4xl + mx-auto) so switching between chat and content
+       *  views doesn't jolt the reading width. px-5 is a touch tighter
+       *  than issue-detail's px-8 because the chat window can be narrow. */}
+      <div className="mx-auto w-full max-w-4xl px-5 py-4 space-y-4">
+        {messages.map((msg) => (
+          <MessageBubble key={msg.id} message={msg} />
+        ))}
+        {hasLive && (
+          <div className="w-full space-y-1.5">
+            <TimelineView items={liveTimeline} />
           </div>
-        </div>
-      )}
-      {isWaiting && !hasTimeline && (
-        <div className="flex items-start gap-3">
-          <AgentAvatar agent={agent} />
-          <div className="flex items-center pt-1">
-            <Loader2 className="size-4 animate-spin text-muted-foreground" />
-          </div>
-        </div>
-      )}
-      <div ref={bottomRef} />
+        )}
+        {isWaiting && !hasLive && !pendingAlreadyPersisted && (
+          <Loader2 className="size-4 animate-spin text-muted-foreground" />
+        )}
+      </div>
     </div>
   );
 }
 
+/**
+ * Placeholder shown while `chat_message` for a session is being fetched
+ * (initial refresh, or switching to an un-cached session). Shape roughly
+ * mirrors an assistant → user → assistant exchange so the window doesn't
+ * shift under the user when real messages arrive.
+ */
+export function ChatMessageSkeleton() {
+  return (
+    <div className="flex-1 overflow-hidden">
+      <div className="mx-auto w-full max-w-4xl px-5 py-4 space-y-5">
+        <div className="space-y-2">
+          <Skeleton className="h-3.5 w-3/4" />
+          <Skeleton className="h-3.5 w-1/2" />
+        </div>
+        <div className="flex justify-end">
+          <Skeleton className="h-8 w-48 rounded-2xl" />
+        </div>
+        <div className="space-y-2">
+          <Skeleton className="h-3.5 w-2/3" />
+          <Skeleton className="h-3.5 w-5/6" />
+          <Skeleton className="h-3.5 w-1/3" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function toTimelineItem(m: TaskMessagePayload): ChatTimelineItem {
+  return {
+    seq: m.seq,
+    type: m.type,
+    tool: m.tool,
+    content: m.content,
+    input: m.input,
+    output: m.output,
+  };
+}
+
 // ─── Message bubbles ─────────────────────────────────────────────────────
 
-function MessageBubble({
-  message,
-  agent,
-}: {
-  message: ChatMessage;
-  agent: Agent | null;
-}) {
+function MessageBubble({ message }: { message: ChatMessage }) {
   if (message.role === "user") {
     return (
       <div className="flex justify-end">
-        <div className="rounded-2xl bg-primary px-3.5 py-2 text-sm text-primary-foreground max-w-[85%] whitespace-pre-wrap break-words">
-          {message.content}
+        <div className="rounded-2xl bg-muted px-3.5 py-2 text-sm max-w-[80%] break-words">
+          {/* User messages are authored as markdown in ContentEditor, so
+           * render them through the same pipeline as assistant replies.
+           * Neutralise prose's leading/trailing margin so single-line
+           * bubbles stay as compact as the plain-text version used to. */}
+          <div className="prose prose-sm dark:prose-invert max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+            <Markdown>{message.content}</Markdown>
+          </div>
         </div>
       </div>
     );
   }
 
-  return <AssistantMessage message={message} agent={agent} />;
+  return <AssistantMessage message={message} />;
 }
 
 function AssistantMessage({
   message,
-  agent,
 }: {
   message: ChatMessage;
-  agent: Agent | null;
 }) {
   const taskId = message.task_id;
 
-  // Always fetch task messages for assistant messages with a task_id
+  // Use the shared taskMessagesOptions so this cache entry is the same one
+  // seeded by useRealtimeSync during task execution — zero refetch when the
+  // task finishes, since WS already populated it.
   const { data: taskMessages } = useQuery({
-    queryKey: ["task-messages", taskId],
-    queryFn: () => api.listTaskMessages(taskId!),
+    ...taskMessagesOptions(taskId ?? ""),
     enabled: !!taskId,
-    staleTime: Infinity,
   });
 
-  const timeline: ChatTimelineItem[] = (taskMessages ?? []).map(
-    (m: TaskMessagePayload) => ({
-      seq: m.seq,
-      type: m.type,
-      tool: m.tool,
-      content: m.content,
-      input: m.input,
-      output: m.output,
-    }),
-  );
+  const timeline: ChatTimelineItem[] = (taskMessages ?? []).map(toTimelineItem);
 
   return (
-    <div className="flex items-start gap-3">
-      <AgentAvatar agent={agent} />
-      <div className="min-w-0 flex-1 space-y-1.5">
-        {timeline.length > 0 ? (
-          <TimelineView items={timeline} />
-        ) : (
-          <div className="text-sm leading-relaxed prose prose-sm dark:prose-invert max-w-none">
-            <Markdown>{message.content}</Markdown>
-          </div>
-        )}
-      </div>
+    <div className="w-full space-y-1.5">
+      {timeline.length > 0 ? (
+        <TimelineView items={timeline} />
+      ) : (
+        <div className="text-sm leading-relaxed prose prose-sm dark:prose-invert max-w-none">
+          <Markdown>{message.content}</Markdown>
+        </div>
+      )}
     </div>
   );
 }
@@ -356,13 +391,3 @@ function ErrorRow({ item }: { item: ChatTimelineItem }) {
 
 // ─── Shared ──────────────────────────────────────────────────────────────
 
-function AgentAvatar({ agent }: { agent: Agent | null }) {
-  return (
-    <Avatar className="size-6 shrink-0 mt-0.5">
-      {agent?.avatar_url && <AvatarImage src={agent.avatar_url} />}
-      <AvatarFallback className="bg-purple-100 text-purple-700">
-        <Bot className="size-3" />
-      </AvatarFallback>
-    </Avatar>
-  );
-}

@@ -40,6 +40,9 @@ export function createMarkdownPasteExtension() {
               const clipboard = event.clipboardData;
               if (!clipboard) return false;
 
+              // If clipboard has files, defer to the fileUpload extension.
+              if (clipboard.files?.length) return false;
+
               const text = clipboard.getData("text/plain");
               if (!text) return false;
 

@@ -59,9 +59,12 @@ func (h *Handler) SubscribeToIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default to current user as member; allow specifying another user/agent
-	targetUserID := requestUserID(r)
-	targetUserType := "member"
+	workspaceID := uuidToString(issue.WorkspaceID)
+	// Default target: the caller, derived via resolveActor so an agent caller
+	// (X-Agent-ID set) subscribes itself rather than the underlying member.
+	callerActorType, callerActorID := h.resolveActor(r, requestUserID(r), workspaceID)
+	targetUserType := callerActorType
+	targetUserID := callerActorID
 	var req struct {
 		UserID   *string `json:"user_id"`
 		UserType *string `json:"user_type"`
@@ -76,6 +79,11 @@ func (h *Handler) SubscribeToIssue(w http.ResponseWriter, r *http.Request) {
 		targetUserType = *req.UserType
 	}
 
+	if !h.isWorkspaceEntity(r.Context(), targetUserType, targetUserID, workspaceID) {
+		writeError(w, http.StatusForbidden, "target user is not a member of this workspace")
+		return
+	}
+
 	err := h.Queries.AddIssueSubscriber(r.Context(), db.AddIssueSubscriberParams{
 		IssueID:  issue.ID,
 		UserType: targetUserType,
@@ -87,10 +95,7 @@ func (h *Handler) SubscribeToIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	workspaceID := uuidToString(issue.WorkspaceID)
-	callerID := requestUserID(r)
-	subActorType, subActorID := h.resolveActor(r, callerID, workspaceID)
-	h.publish(protocol.EventSubscriberAdded, workspaceID, subActorType, subActorID, map[string]any{
+	h.publish(protocol.EventSubscriberAdded, workspaceID, callerActorType, callerActorID, map[string]any{
 		"issue_id":  issueID,
 		"user_type": targetUserType,
 		"user_id":   targetUserID,
@@ -109,8 +114,12 @@ func (h *Handler) UnsubscribeFromIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetUserID := requestUserID(r)
-	targetUserType := "member"
+	workspaceID := uuidToString(issue.WorkspaceID)
+	// Default target: the caller, derived via resolveActor so an agent caller
+	// (X-Agent-ID set) unsubscribes itself rather than the underlying member.
+	callerActorType, callerActorID := h.resolveActor(r, requestUserID(r), workspaceID)
+	targetUserType := callerActorType
+	targetUserID := callerActorID
 	var req struct {
 		UserID   *string `json:"user_id"`
 		UserType *string `json:"user_type"`
@@ -125,6 +134,11 @@ func (h *Handler) UnsubscribeFromIssue(w http.ResponseWriter, r *http.Request) {
 		targetUserType = *req.UserType
 	}
 
+	if !h.isWorkspaceEntity(r.Context(), targetUserType, targetUserID, workspaceID) {
+		writeError(w, http.StatusForbidden, "target user is not a member of this workspace")
+		return
+	}
+
 	err := h.Queries.RemoveIssueSubscriber(r.Context(), db.RemoveIssueSubscriberParams{
 		IssueID:  issue.ID,
 		UserType: targetUserType,
@@ -135,10 +149,7 @@ func (h *Handler) UnsubscribeFromIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	workspaceID := uuidToString(issue.WorkspaceID)
-	callerID := requestUserID(r)
-	unsubActorType, unsubActorID := h.resolveActor(r, callerID, workspaceID)
-	h.publish(protocol.EventSubscriberRemoved, workspaceID, unsubActorType, unsubActorID, map[string]any{
+	h.publish(protocol.EventSubscriberRemoved, workspaceID, callerActorType, callerActorID, map[string]any{
 		"issue_id":  issueID,
 		"user_type": targetUserType,
 		"user_id":   targetUserID,

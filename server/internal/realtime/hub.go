@@ -2,10 +2,14 @@ package realtime
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
@@ -17,17 +21,86 @@ type MembershipChecker interface {
 	IsMember(ctx context.Context, userID, workspaceID string) bool
 }
 
+// SlugResolver translates a workspace slug to its UUID. Used by HandleWebSocket
+// to accept slug-based identification from the frontend.
+type SlugResolver func(ctx context.Context, slug string) (workspaceID string, err error)
+
 // PATResolver resolves a Personal Access Token to a user ID.
 // Returns the user ID and true if the token is valid, or ("", false) otherwise.
 type PATResolver interface {
 	ResolveToken(ctx context.Context, token string) (userID string, ok bool)
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		// TODO: Restrict origins in production
+var allowedWSOrigins atomic.Value // holds []string
+
+func init() {
+	allowedWSOrigins.Store(loadAllowedOrigins())
+}
+
+func loadAllowedOrigins() []string {
+	raw := strings.TrimSpace(os.Getenv("ALLOWED_ORIGINS"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
+	}
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("FRONTEND_ORIGIN"))
+	}
+	if raw == "" {
+		return []string{
+			"http://localhost:3000",
+			"http://localhost:5173",
+			"http://localhost:5174",
+		}
+	}
+
+	parts := strings.Split(raw, ",")
+	origins := make([]string, 0, len(parts))
+	for _, part := range parts {
+		origin := strings.TrimSpace(part)
+		if origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+	return origins
+}
+
+// SetAllowedOrigins overrides the WebSocket origin whitelist (called from router setup).
+func SetAllowedOrigins(origins []string) {
+	allowedWSOrigins.Store(origins)
+}
+
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
 		return true
-	},
+	}
+	origins := allowedWSOrigins.Load().([]string)
+	for _, allowed := range origins {
+		if origin == allowed {
+			return true
+		}
+	}
+	slog.Warn("ws: rejected origin", "origin", origin)
+	return false
+}
+
+const (
+	// writeWait is the time allowed to write a message to the peer.
+	writeWait = 10 * time.Second
+
+	// pongWait is the time allowed to read the next pong message from the peer.
+	// Connections that miss a pong within this window are considered dead and
+	// are closed, freeing goroutines and channel memory.
+	pongWait = 60 * time.Second
+
+	// pingPeriod is how often the server sends a ping to keep the connection
+	// alive through intermediate proxies and load balancers. Must be less than
+	// pongWait so that a missing pong is detected before the next ping is due.
+	pingPeriod = (pongWait * 9) / 10
+)
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: checkOrigin,
 }
 
 // Client represents a single WebSocket connection with identity.
@@ -220,67 +293,130 @@ func (h *Hub) Broadcast(message []byte) {
 	h.broadcast <- message
 }
 
-// HandleWebSocket upgrades an HTTP connection to WebSocket with JWT or PAT auth.
-func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, w http.ResponseWriter, r *http.Request) {
-	tokenStr := r.URL.Query().Get("token")
-	workspaceID := r.URL.Query().Get("workspace_id")
-
-	if tokenStr == "" || workspaceID == "" {
-		http.Error(w, `{"error":"token and workspace_id required"}`, http.StatusUnauthorized)
-		return
-	}
-
-	var userID string
-
+// authenticateToken validates a JWT or PAT string and returns the user ID.
+func authenticateToken(tokenStr string, pr PATResolver, ctx context.Context) (string, string) {
 	if strings.HasPrefix(tokenStr, "mul_") {
-		// PAT authentication
 		if pr == nil {
-			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
-			return
+			return "", `{"error":"invalid token"}`
 		}
-		uid, ok := pr.ResolveToken(r.Context(), tokenStr)
+		uid, ok := pr.ResolveToken(ctx, tokenStr)
 		if !ok {
-			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
-			return
+			return "", `{"error":"invalid token"}`
 		}
-		userID = uid
-	} else {
-		// JWT authentication
-		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return auth.JWTSecret(), nil
-		})
-		if err != nil || !token.Valid {
-			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
-			return
-		}
-
-		claims, ok := token.Claims.(jwt.MapClaims)
-		if !ok {
-			http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
-			return
-		}
-
-		uid, ok := claims["sub"].(string)
-		if !ok || strings.TrimSpace(uid) == "" {
-			http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
-			return
-		}
-		userID = uid
+		return uid, ""
 	}
 
-	// Verify user is a member of the workspace
-	if !mc.IsMember(r.Context(), userID, workspaceID) {
-		http.Error(w, `{"error":"not a member of this workspace"}`, http.StatusForbidden)
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return auth.JWTSecret(), nil
+	})
+	if err != nil || !token.Valid {
+		return "", `{"error":"invalid token"}`
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", `{"error":"invalid claims"}`
+	}
+
+	uid, ok := claims["sub"].(string)
+	if !ok || strings.TrimSpace(uid) == "" {
+		return "", `{"error":"invalid claims"}`
+	}
+	return uid, ""
+}
+
+// firstMessageAuth reads the first WebSocket message expecting an auth payload.
+// Message format: {"type":"auth","payload":{"token":"..."}}
+// Returns the token string or an error description.
+func firstMessageAuth(conn *websocket.Conn) (string, string) {
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer conn.SetReadDeadline(time.Time{}) // clear deadline for subsequent reads
+
+	_, raw, err := conn.ReadMessage()
+	if err != nil {
+		return "", `{"error":"auth timeout or read error"}`
+	}
+
+	var msg struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Token string `json:"token"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil || msg.Type != "auth" || msg.Payload.Token == "" {
+		return "", `{"error":"expected auth message as first frame"}`
+	}
+
+	return msg.Payload.Token, ""
+}
+
+// HandleWebSocket upgrades an HTTP connection to WebSocket with cookie or first-message auth.
+// resolveSlug may be nil if slug-based identification is not needed (e.g. in tests).
+func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug SlugResolver, w http.ResponseWriter, r *http.Request) {
+	workspaceID := r.URL.Query().Get("workspace_id")
+	if workspaceID == "" {
+		if slug := r.URL.Query().Get("workspace_slug"); slug != "" && resolveSlug != nil {
+			resolved, err := resolveSlug(r.Context(), slug)
+			if err != nil {
+				http.Error(w, `{"error":"workspace not found"}`, http.StatusNotFound)
+				return
+			}
+			workspaceID = resolved
+		}
+	}
+	if workspaceID == "" {
+		http.Error(w, `{"error":"workspace_id or workspace_slug required"}`, http.StatusBadRequest)
 		return
 	}
 
+	// Try cookie auth first (web clients).
+	var userID string
+	if cookie, err := r.Cookie(auth.AuthCookieName); err == nil && cookie.Value != "" {
+		uid, errMsg := authenticateToken(cookie.Value, pr, r.Context())
+		if errMsg != "" {
+			http.Error(w, errMsg, http.StatusUnauthorized)
+			return
+		}
+		if !mc.IsMember(r.Context(), uid, workspaceID) {
+			http.Error(w, `{"error":"not a member of this workspace"}`, http.StatusForbidden)
+			return
+		}
+		userID = uid
+	}
+
+	// Upgrade the connection. Clients without cookies (desktop) will authenticate
+	// via the first WebSocket message, so we must upgrade before we have a token.
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("websocket upgrade failed", "error", err)
 		return
+	}
+
+	// First-message auth for non-cookie clients (desktop, CLI).
+	if userID == "" {
+		tokenStr, errMsg := firstMessageAuth(conn)
+		if errMsg != "" {
+			conn.WriteMessage(websocket.TextMessage, []byte(errMsg))
+			conn.Close()
+			return
+		}
+		uid, errMsg := authenticateToken(tokenStr, pr, r.Context())
+		if errMsg != "" {
+			conn.WriteMessage(websocket.TextMessage, []byte(errMsg))
+			conn.Close()
+			return
+		}
+		if !mc.IsMember(r.Context(), uid, workspaceID) {
+			conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"not a member of this workspace"}`))
+			conn.Close()
+			return
+		}
+		userID = uid
+
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"auth_ack"}`))
 	}
 
 	client := &Client{
@@ -302,6 +438,15 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	// Require a pong within pongWait of each ping. The deadline is refreshed
+	// every time a pong frame arrives, so a healthy connection stays open
+	// indefinitely. A dead connection (no pong) is detected within pongWait.
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	for {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
@@ -316,12 +461,30 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
-	defer c.conn.Close()
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
 
-	for message := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-			slog.Warn("websocket write error", "error", err)
-			return
+	for {
+		select {
+		case message, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				// Hub closed the channel (slow-client eviction or shutdown).
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				slog.Warn("websocket write error", "error", err, "user_id", c.userID, "workspace_id", c.workspaceID)
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }

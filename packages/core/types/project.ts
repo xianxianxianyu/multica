@@ -14,6 +14,8 @@ export interface Project {
   lead_id: string | null;
   created_at: string;
   updated_at: string;
+  issue_count: number;
+  done_count: number;
 }
 
 export interface CreateProjectRequest {

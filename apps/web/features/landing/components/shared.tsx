@@ -1,7 +1,7 @@
 import { cn } from "@multica/ui/lib/utils";
 
 export const githubUrl = "https://github.com/multica-ai/multica";
-export const twitterUrl = "https://x.com/multica_hq";
+export const twitterUrl = "https://x.com/MulticaAI";
 
 export function GitHubMark({ className }: { className?: string }) {
   return (
@@ -132,6 +132,19 @@ export function OpenClawLogo({ className }: { className?: string }) {
         <rect x="6" y="4" width="1" height="1" />
         <rect x="9" y="4" width="1" height="1" />
       </g>
+    </svg>
+  );
+}
+
+export function GeminiCliLogo({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className={className}
+      fill="currentColor"
+    >
+      <path d="M12 0C12 0 12 8 8 12C12 12 12 12 12 24C12 24 12 16 16 12C12 12 12 12 12 0Z" />
     </svg>
   );
 }
