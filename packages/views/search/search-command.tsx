@@ -24,18 +24,19 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Command as CommandPrimitive } from "cmdk";
-import { useQuery } from "@tanstack/react-query";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import type { SearchIssueResult, SearchProjectResult } from "@multica/core/types";
 import { api } from "@multica/core/api";
 import { useRecentIssuesStore } from "@multica/core/issues/stores";
-import { issueListOptions } from "@multica/core/issues/queries";
+import { issueDetailOptions } from "@multica/core/issues/queries";
 import { useWorkspaceId } from "@multica/core";
 import { paths, useCurrentWorkspace, useWorkspacePaths } from "@multica/core/paths";
 import type { WorkspacePaths } from "@multica/core/paths";
 import { useModalStore } from "@multica/core/modals";
 import { workspaceListOptions } from "@multica/core/workspace/queries";
 import { StatusIcon } from "../issues/components";
+import { ProjectIcon } from "../projects/components/project-icon";
 import { STATUS_CONFIG } from "@multica/core/issues/config";
 import { PROJECT_STATUS_CONFIG } from "@multica/core/projects/config";
 import type { ProjectStatus } from "@multica/core/types";
@@ -140,18 +141,22 @@ export function SearchCommand() {
   const recentItems = useRecentIssuesStore((s) => s.items);
   const wsId = useWorkspaceId();
   const p: WorkspacePaths = useWorkspacePaths();
-  const { data: allIssues = [] } = useQuery(issueListOptions(wsId));
   const { theme, setTheme } = useTheme();
   const currentWorkspace = useCurrentWorkspace();
   const { data: workspaces = [] } = useQuery(workspaceListOptions());
 
-  const recentIssues = useMemo(() => {
-    const issueMap = new Map(allIssues.map((i) => [i.id, i]));
-    return recentItems.flatMap((item) => {
-      const issue = issueMap.get(item.id);
-      return issue ? [issue] : [];
-    });
-  }, [recentItems, allIssues]);
+  // Resolve each recent issue via its cached detail entry. Recent items are
+  // typically already in the detail cache because the user has opened them;
+  // if not, this triggers a lookup per id so Recent never depends on whether
+  // the issue falls inside the paginated list cache.
+  const recentDetailQueries = useQueries({
+    queries: recentItems.map((item) => issueDetailOptions(wsId, item.id)),
+  });
+  const recentIssues = useMemo(
+    () =>
+      recentDetailQueries.flatMap((q) => (q.data ? [q.data] : [])),
+    [recentDetailQueries],
+  );
 
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResults>({ issues: [], projects: [] });
@@ -171,13 +176,15 @@ export function SearchCommand() {
 
   // Detect if current route is an issue detail page — /{slug}/issues/{id}.
   // Falls back to null on any other route; used to gate issue-specific commands.
-  const currentIssue = useMemo(() => {
+  const currentIssueId = useMemo(() => {
     const match = pathname.match(/\/issues\/([^/]+)$/);
     const raw = match?.[1];
-    if (!raw) return null;
-    const id = decodeURIComponent(raw);
-    return allIssues.find((i) => i.id === id) ?? null;
-  }, [pathname, allIssues]);
+    return raw ? decodeURIComponent(raw) : null;
+  }, [pathname]);
+  const { data: currentIssue = null } = useQuery({
+    ...issueDetailOptions(wsId, currentIssueId ?? ""),
+    enabled: !!currentIssueId,
+  });
 
   const commands = useMemo<CommandItem[]>(() => {
     const activeThemeCheck = (value: ThemeValue) =>
@@ -195,7 +202,7 @@ export function SearchCommand() {
         icon: Plus,
         keywords: ["new", "issue", "create", "add"],
         onSelect: () => {
-          useModalStore.getState().open("create-issue");
+          useModalStore.getState().open("quick-create-issue");
           setOpen(false);
         },
       },
@@ -567,9 +574,7 @@ export function SearchCommand() {
                     className="flex cursor-default select-none flex-col gap-1 rounded-lg px-3 py-2.5 text-sm outline-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-accent"
                   >
                     <div className="flex items-center gap-2.5">
-                      <span className="size-4 shrink-0 text-center text-sm leading-4">
-                        {project.icon || <FolderKanban className="size-4 text-muted-foreground" />}
-                      </span>
+                      <ProjectIcon project={project} size="md" />
                       <span className="truncate">
                         <HighlightText text={project.title} query={query} />
                       </span>

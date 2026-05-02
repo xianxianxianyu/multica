@@ -8,10 +8,54 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/multica-ai/multica/server/internal/middleware"
 )
+
+// slowProbeLocalSkillListStore wraps a LocalSkillListStore but blocks inside
+// HasPending until the provided context is cancelled. PopPending delegates
+// to the underlying store. Used to verify that a stalled probe cannot wedge
+// the heartbeat — the bound context must cut it short — while the ack-safe
+// PopPending path is never reached because HasPending returns an error, not
+// true.
+type slowProbeLocalSkillListStore struct{ LocalSkillListStore }
+
+func (s slowProbeLocalSkillListStore) HasPending(ctx context.Context, _ string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+type slowProbeLocalSkillImportStore struct{ LocalSkillImportStore }
+
+func (s slowProbeLocalSkillImportStore) HasPending(ctx context.Context, _ string) (bool, error) {
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// popRecordingLocalSkillListStore counts PopPending calls so a test can assert
+// that the handler never reaches the ack-unsafe side-effecting claim path
+// when HasPending reports an empty queue.
+type popRecordingLocalSkillListStore struct {
+	LocalSkillListStore
+	popCalls int
+}
+
+func (s *popRecordingLocalSkillListStore) PopPending(ctx context.Context, runtimeID string) (*RuntimeLocalSkillListRequest, error) {
+	s.popCalls++
+	return s.LocalSkillListStore.PopPending(ctx, runtimeID)
+}
+
+type popRecordingLocalSkillImportStore struct {
+	LocalSkillImportStore
+	popCalls int
+}
+
+func (s *popRecordingLocalSkillImportStore) PopPending(ctx context.Context, runtimeID string) (*RuntimeLocalSkillImportRequest, error) {
+	s.popCalls++
+	return s.LocalSkillImportStore.PopPending(ctx, runtimeID)
+}
 
 func setHandlerTestWorkspaceRepos(t *testing.T, repos []map[string]string) {
 	t.Helper()
@@ -135,6 +179,84 @@ func TestDaemonHeartbeat_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	testHandler.DaemonHeartbeat(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("DaemonHeartbeat with cross-workspace token: expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestDaemonHeartbeat_SlowProbeDoesNotWedge pins the invariant that a stalled
+// HasPending probe cannot wedge the heartbeat endpoint past the per-probe
+// timeout. The probe is the only bounded call; PopPending is ack-safe-
+// critical and is intentionally left unbounded. Without the probe bound the
+// heartbeat would hang on a slow shared store.
+func TestDaemonHeartbeat_SlowProbeDoesNotWedge(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	runtimeID := createRuntimeLocalSkillTestRuntime(t, testUserID)
+
+	origList := testHandler.LocalSkillListStore
+	origImport := testHandler.LocalSkillImportStore
+	testHandler.LocalSkillListStore = slowProbeLocalSkillListStore{origList}
+	testHandler.LocalSkillImportStore = slowProbeLocalSkillImportStore{origImport}
+	t.Cleanup(func() {
+		testHandler.LocalSkillListStore = origList
+		testHandler.LocalSkillImportStore = origImport
+	})
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/heartbeat", map[string]any{
+		"runtime_id": runtimeID,
+	}, testWorkspaceID, "runtime-local-skills-daemon")
+
+	start := time.Now()
+	testHandler.DaemonHeartbeat(w, req)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat with slow probes: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// Two bounded probes at 1s each + a small fixed slack.
+	if elapsed > 3*time.Second {
+		t.Fatalf("DaemonHeartbeat took %s; expected fast return despite slow probes", elapsed)
+	}
+}
+
+// TestDaemonHeartbeat_EmptyQueueSkipsPopPending pins the ack-safety property:
+// when HasPending reports no work, the heartbeat must NOT invoke PopPending,
+// because PopPending's Redis implementation has non-atomic side effects that
+// a client-side cancel cannot cleanly un-run (see GH #1637 review).
+func TestDaemonHeartbeat_EmptyQueueSkipsPopPending(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	runtimeID := createRuntimeLocalSkillTestRuntime(t, testUserID)
+
+	origList := testHandler.LocalSkillListStore
+	origImport := testHandler.LocalSkillImportStore
+	listSpy := &popRecordingLocalSkillListStore{LocalSkillListStore: origList}
+	importSpy := &popRecordingLocalSkillImportStore{LocalSkillImportStore: origImport}
+	testHandler.LocalSkillListStore = listSpy
+	testHandler.LocalSkillImportStore = importSpy
+	t.Cleanup(func() {
+		testHandler.LocalSkillListStore = origList
+		testHandler.LocalSkillImportStore = origImport
+	})
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest(http.MethodPost, "/api/daemon/heartbeat", map[string]any{
+		"runtime_id": runtimeID,
+	}, testWorkspaceID, "runtime-local-skills-daemon")
+
+	testHandler.DaemonHeartbeat(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("DaemonHeartbeat: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if listSpy.popCalls != 0 {
+		t.Fatalf("expected 0 PopPending calls on empty list queue, got %d", listSpy.popCalls)
+	}
+	if importSpy.popCalls != 0 {
+		t.Fatalf("expected 0 PopPending calls on empty import queue, got %d", importSpy.popCalls)
 	}
 }
 
@@ -713,7 +835,9 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime(t *testing.T) {
 	`, legacyAgentID, legacyIssueID, legacyRuntimeID).Scan(&legacyTaskID); err != nil {
 		t.Fatalf("seed legacy task: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, legacyTaskID) })
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, legacyTaskID)
+	})
 
 	// Register under the new stable UUID, declaring the prior hostname-derived
 	// id as legacy. The handler should merge the legacy row into the new one.
@@ -795,8 +919,8 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime_ReverseDotLocal(t *testing.T
 	}
 
 	ctx := context.Background()
-	const legacyDaemonID = "ReverseDotLocalHost"                          // stored without .local
-	const emittedLegacyID = "ReverseDotLocalHost.local"                    // daemon now reports with .local
+	const legacyDaemonID = "ReverseDotLocalHost"        // stored without .local
+	const emittedLegacyID = "ReverseDotLocalHost.local" // daemon now reports with .local
 	const newDaemonID = "0192a7b0-0011-7ee9-9c21-30a5bcf86aa2"
 
 	var legacyRuntimeID string
@@ -853,8 +977,8 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime_CaseDrift(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	const storedDaemonID = "Jiayuans-MacBook-Pro.local"     // DB has original mixed case
-	const emittedLegacyID = "jiayuans-macbook-pro.local"    // Daemon now reports lowercased
+	const storedDaemonID = "Jiayuans-MacBook-Pro.local"  // DB has original mixed case
+	const emittedLegacyID = "jiayuans-macbook-pro.local" // Daemon now reports lowercased
 	const newDaemonID = "0192a7b0-0022-7ee9-9c21-30a5bcf86aa3"
 
 	var legacyRuntimeID string
@@ -1135,5 +1259,540 @@ func TestStartTask_AutopilotRunOnlyTask_ResolvesWorkspace(t *testing.T) {
 	}
 	if status != "running" {
 		t.Fatalf("expected task status 'running' after StartTask, got %q", status)
+	}
+}
+
+// ClaimTaskByRuntime must surface the issue's project github_repo resources
+// as resp.Repos and hide the workspace-bound repos. Without this the agent
+// would see two repo lists in the meta-skill and have no signal about which
+// belongs to the current issue.
+func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	// Workspace repos: two of them, neither matches the project repo URL.
+	setHandlerTestWorkspaceRepos(t, []map[string]string{
+		{"url": "https://github.com/example/workspace-repo-a", "description": "ws a"},
+		{"url": "https://github.com/example/workspace-repo-b", "description": "ws b"},
+	})
+
+	// Project + project_resource(github_repo) with a URL that is NOT in the
+	// workspace's repos list.
+	var projectID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO project (workspace_id, title) VALUES ($1, $2) RETURNING id
+	`, testWorkspaceID, "Claim project repo override").Scan(&projectID); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM project WHERE id = $1`, projectID) })
+
+	const projectRepoURL = "https://github.com/example/project-only-repo"
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO project_resource (
+			project_id, workspace_id, resource_type, resource_ref, position
+		) VALUES ($1, $2, 'github_repo', $3::jsonb, 0)
+	`, projectID, testWorkspaceID, `{"url":"`+projectRepoURL+`"}`); err != nil {
+		t.Fatalf("create project_resource: %v", err)
+	}
+
+	// Agent + runtime + queued task in this project.
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
+		testWorkspaceID,
+	).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (
+			workspace_id, project_id, title, status, priority, creator_id, creator_type, number, position
+		) VALUES ($1, $2, 'project repo override', 'todo', 'medium', $3, 'member', 88001, 0)
+		RETURNING id
+	`, testWorkspaceID, projectID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority
+		) VALUES ($1, $2, $3, 'queued', 0)
+		RETURNING id
+	`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-project-repos")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ClaimTaskByRuntime: %d %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Task *struct {
+			Repos            []RepoData            `json:"repos"`
+			ProjectID        string                `json:"project_id"`
+			ProjectResources []ProjectResourceData `json:"project_resources"`
+		} `json:"task"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Task == nil {
+		t.Fatal("expected task in response")
+	}
+	if resp.Task.ProjectID != projectID {
+		t.Errorf("project_id = %q, want %q", resp.Task.ProjectID, projectID)
+	}
+	if len(resp.Task.Repos) != 1 || resp.Task.Repos[0].URL != projectRepoURL {
+		t.Fatalf("expected resp.Repos to contain only the project repo URL, got %+v", resp.Task.Repos)
+	}
+	for _, r := range resp.Task.Repos {
+		if strings.HasSuffix(r.URL, "workspace-repo-a") || strings.HasSuffix(r.URL, "workspace-repo-b") {
+			t.Errorf("workspace repo %q leaked into resp.Repos despite project override", r.URL)
+		}
+	}
+	if len(resp.Task.ProjectResources) != 1 {
+		t.Errorf("expected 1 project_resources entry, got %d", len(resp.Task.ProjectResources))
+	}
+}
+
+// When the issue's project has no github_repo resources, the claim handler
+// must fall back to workspace repos (the pre-override behavior).
+func TestClaimTask_ProjectWithoutRepos_FallsBackToWorkspaceRepos(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	setHandlerTestWorkspaceRepos(t, []map[string]string{
+		{"url": "https://github.com/example/workspace-fallback", "description": "ws"},
+	})
+
+	var projectID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO project (workspace_id, title) VALUES ($1, $2) RETURNING id
+	`, testWorkspaceID, "Claim project without repos").Scan(&projectID); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM project WHERE id = $1`, projectID) })
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
+		testWorkspaceID,
+	).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("get agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (
+			workspace_id, project_id, title, status, priority, creator_id, creator_type, number, position
+		) VALUES ($1, $2, 'no project repos', 'todo', 'medium', $3, 'member', 88002, 0)
+		RETURNING id
+	`, testWorkspaceID, projectID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority
+		) VALUES ($1, $2, $3, 'queued', 0)
+		RETURNING id
+	`, agentID, runtimeID, issueID).Scan(&taskID); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil, testWorkspaceID, "test-claim-fallback")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	testHandler.ClaimTaskByRuntime(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ClaimTaskByRuntime: %d %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Task *struct {
+			Repos []RepoData `json:"repos"`
+		} `json:"task"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Task == nil {
+		t.Fatal("expected task in response")
+	}
+	if len(resp.Task.Repos) != 1 || !strings.HasSuffix(resp.Task.Repos[0].URL, "workspace-fallback") {
+		t.Fatalf("expected workspace fallback repo, got %+v", resp.Task.Repos)
+	}
+}
+
+// Regression test for #1276: ClaimTaskByRuntime must populate workspace_id in
+// the response for run_only autopilot tasks. Before the fix, resp.WorkspaceID
+// stayed empty because ClaimTaskByRuntime only handled IssueID and
+// ChatSessionID branches, causing the daemon's execenv to fail with
+// "workspace ID is required".
+func TestClaimTask_AutopilotRunOnly_PopulatesWorkspaceID(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	var autopilotID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot (
+			workspace_id, title, assignee_id, execution_mode,
+			created_by_type, created_by_id
+		)
+		VALUES ($1, 'claim workspace fixture', $2, 'run_only', 'member', $3)
+		RETURNING id
+	`, testWorkspaceID, agentID, testUserID).Scan(&autopilotID); err != nil {
+		t.Fatalf("setup: create autopilot: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM autopilot WHERE id = $1`, autopilotID)
+
+	var runID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO autopilot_run (autopilot_id, source, status)
+		VALUES ($1, 'manual', 'running')
+		RETURNING id
+	`, autopilotID).Scan(&runID); err != nil {
+		t.Fatalf("setup: create autopilot_run: %v", err)
+	}
+
+	// Create a queued task with only AutopilotRunID (no IssueID, no ChatSessionID).
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, autopilot_run_id
+		)
+		VALUES ($1, $2, NULL, 'queued', 0, $3)
+		RETURNING id
+	`, agentID, runtimeID, runID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create autopilot task: %v", err)
+	}
+	defer testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/claim", nil,
+		testWorkspaceID, "test-daemon-claim")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("runtimeId", runtimeID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	testHandler.ClaimTaskByRuntime(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ClaimTaskByRuntime: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Task *struct {
+			WorkspaceID string `json:"workspace_id"`
+		} `json:"task"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Task == nil {
+		t.Fatal("expected a task in response, got nil")
+	}
+	if resp.Task.WorkspaceID == "" {
+		t.Fatal("ClaimTaskByRuntime for run_only autopilot: workspace_id is empty in response")
+	}
+	if resp.Task.WorkspaceID != testWorkspaceID {
+		t.Fatalf("expected workspace_id %q, got %q", testWorkspaceID, resp.Task.WorkspaceID)
+	}
+}
+
+// TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects verifies
+// the defense-in-depth check in ClaimTaskByRuntime: if a task is somehow
+// dispatched to a runtime whose workspace doesn't match the task's
+// resolved workspace (upstream routing / data-integrity bug), the handler
+// must 500 AND cancel the dispatched task so it doesn't sit in
+// 'dispatched' until the 5-minute sweeper — which would also leave the
+// agent stuck reporting 'working' in the UI.
+func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	// Local agent/runtime (belongs to testWorkspace).
+	var localAgentID, localRuntimeID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id, runtime_id FROM agent WHERE workspace_id = $1 LIMIT 1`,
+		testWorkspaceID,
+	).Scan(&localAgentID, &localRuntimeID); err != nil {
+		t.Fatalf("setup: get local agent: %v", err)
+	}
+
+	// Foreign workspace with its own issue — what the misrouted task will
+	// resolve to.
+	var foreignWorkspaceID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, "Mismatch Foreign", "mismatch-foreign-claim", "", "MFC").Scan(&foreignWorkspaceID); err != nil {
+		t.Fatalf("setup: create foreign workspace: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, foreignWorkspaceID) })
+
+	var foreignIssueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'mismatch-foreign-issue', 'todo', 'medium', $2, 'member', 77001, 0)
+		RETURNING id
+	`, foreignWorkspaceID, testUserID).Scan(&foreignIssueID); err != nil {
+		t.Fatalf("setup: create foreign issue: %v", err)
+	}
+
+	// Construct the inconsistent task: runtime_id belongs to testWorkspace,
+	// but issue_id is in foreignWorkspace. This is the data shape a routing
+	// bug would produce.
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
+		VALUES ($1, $2, $3, 'queued', 2)
+		RETURNING id
+	`, localAgentID, localRuntimeID, foreignIssueID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create mismatched task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+localRuntimeID+"/claim", nil,
+		testWorkspaceID, "legit-daemon")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("runtimeId", localRuntimeID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	testHandler.ClaimTaskByRuntime(w, req)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("ClaimTaskByRuntime (mismatch): expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Task must NOT remain dispatched — it has to be cancelled so the agent
+	// is released immediately rather than stuck until the sweeper fires.
+	var status string
+	if err := testPool.QueryRow(ctx,
+		`SELECT status FROM agent_task_queue WHERE id = $1`, taskID,
+	).Scan(&status); err != nil {
+		t.Fatalf("read task status: %v", err)
+	}
+	if status != "cancelled" {
+		t.Fatalf("ClaimTaskByRuntime (mismatch): expected task status=cancelled, got %q", status)
+	}
+}
+
+// Regression test for MUL-1198: comment-triggered tasks that finish without
+// the agent posting any comment must still deliver a synthesized result
+// comment, threaded under the trigger. Before the fix, CompleteTask exempted
+// comment-triggered tasks from the auto-synthesis path, so a Claude Code /
+// Codex / etc. agent that ended its run with only terminal text (no
+// `multica issue comment add` call) left the user staring at a "Completed"
+// badge with no reply.
+func TestCompleteTask_CommentTriggered_SynthesizesCommentWhenAgentSilent(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'mul-1198 fixture', 'in_progress', 'none', $2, 'member', 81198, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("setup: create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var triggerCommentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+		VALUES ($1, $2, 'member', $3, 'please take a look', 'comment')
+		RETURNING id
+	`, issueID, testWorkspaceID, testUserID).Scan(&triggerCommentID); err != nil {
+		t.Fatalf("setup: create trigger comment: %v", err)
+	}
+
+	// Comment-triggered, already running (as CompleteAgentTask requires).
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, trigger_comment_id,
+			status, priority, started_at
+		)
+		VALUES ($1, $2, $3, $4, 'running', 0, now())
+		RETURNING id
+	`, agentID, runtimeID, issueID, triggerCommentID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create comment-triggered task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	const agentFinalOutput = "sure, will look into it shortly"
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
+		map[string]any{"output": agentFinalOutput},
+		testWorkspaceID, "legit-daemon")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("taskId", taskID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	testHandler.CompleteTask(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Exactly one agent comment on the issue, threaded under the trigger,
+	// carrying the agent's final output.
+	rows, err := testPool.Query(ctx, `
+		SELECT content, parent_id FROM comment
+		WHERE issue_id = $1 AND author_type = 'agent' AND author_id = $2
+		ORDER BY created_at ASC
+	`, issueID, agentID)
+	if err != nil {
+		t.Fatalf("query synthesized comments: %v", err)
+	}
+	defer rows.Close()
+
+	var (
+		content  string
+		parentID *string
+		seen     int
+	)
+	for rows.Next() {
+		if err := rows.Scan(&content, &parentID); err != nil {
+			t.Fatalf("scan comment: %v", err)
+		}
+		seen++
+	}
+	if seen != 1 {
+		t.Fatalf("expected exactly 1 synthesized agent comment, got %d", seen)
+	}
+	if content != agentFinalOutput {
+		t.Fatalf("synthesized comment content = %q, want %q", content, agentFinalOutput)
+	}
+	if parentID == nil || *parentID != triggerCommentID {
+		got := "<nil>"
+		if parentID != nil {
+			got = *parentID
+		}
+		t.Fatalf("synthesized comment parent_id = %s, want trigger comment %s", got, triggerCommentID)
+	}
+}
+
+// Companion to the above: when the agent DID post its own comment during the
+// run, CompleteTask must not synthesize a duplicate. Guards against the
+// common case where the fix is over-eager and creates two comments per task.
+func TestCompleteTask_CommentTriggered_SkipsSynthesisWhenAgentAlreadyCommented(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+
+	var agentID, runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		SELECT a.id, a.runtime_id FROM agent a WHERE a.workspace_id = $1 LIMIT 1
+	`, testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
+		t.Fatalf("setup: get agent: %v", err)
+	}
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'mul-1198 dedup fixture', 'in_progress', 'none', $2, 'member', 81199, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("setup: create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var triggerCommentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+		VALUES ($1, $2, 'member', $3, 'please take a look', 'comment')
+		RETURNING id
+	`, issueID, testWorkspaceID, testUserID).Scan(&triggerCommentID); err != nil {
+		t.Fatalf("setup: create trigger comment: %v", err)
+	}
+
+	var taskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, trigger_comment_id,
+			status, priority, started_at
+		)
+		VALUES ($1, $2, $3, $4, 'running', 0, now())
+		RETURNING id
+	`, agentID, runtimeID, issueID, triggerCommentID).Scan(&taskID); err != nil {
+		t.Fatalf("setup: create comment-triggered task: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+
+	// Agent posts its own reply during the run — exactly the compliant path.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, parent_id)
+		VALUES ($1, $2, 'agent', $3, 'done, see PR', 'comment', $4)
+	`, issueID, testWorkspaceID, agentID, triggerCommentID); err != nil {
+		t.Fatalf("setup: create agent reply: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := newDaemonTokenRequest("POST", "/api/daemon/tasks/"+taskID+"/complete",
+		map[string]any{"output": "final terminal text that must NOT become a comment"},
+		testWorkspaceID, "legit-daemon")
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("taskId", taskID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	testHandler.CompleteTask(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("CompleteTask: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM comment
+		WHERE issue_id = $1 AND author_type = 'agent' AND author_id = $2
+	`, issueID, agentID).Scan(&count); err != nil {
+		t.Fatalf("count agent comments: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 agent comment (the agent's own reply), got %d — synthesis duplicated", count)
 	}
 }

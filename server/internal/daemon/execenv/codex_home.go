@@ -89,12 +89,34 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 		}
 	}
 
+	// Drop `[[skills.config]]` entries inherited from the user's
+	// ~/.codex/config.toml. Codex Desktop writes plugin-backed skills with a
+	// `name` and no `path`, which the CLI's stricter TOML parser rejects with
+	// `missing field path` and bails out of `thread/start`. Multica writes the
+	// agent's active skills directly to `codex-home/skills/`, so the
+	// user-level registry is redundant here. See codex_skill_strip.go.
+	if err := sanitizeCopiedCodexConfig(filepath.Join(codexHome, "config.toml")); err != nil {
+		logger.Warn("execenv: codex-home sanitize config failed", "error", err)
+	}
+
+	if err := exposeSharedCodexPluginCache(codexHome, sharedHome); err != nil {
+		logger.Warn("execenv: codex-home plugin cache exposure failed", "error", err)
+	}
+
 	// Write a daemon-managed sandbox block into config.toml. On macOS we may
 	// need to fall back to danger-full-access because of openai/codex#10390;
 	// see codex_sandbox.go for the full rationale.
 	policy := codexSandboxPolicyFor(opts.GOOS, opts.CodexVersion)
 	if err := ensureCodexSandboxConfig(filepath.Join(codexHome, "config.toml"), policy, opts.CodexVersion, logger); err != nil {
 		logger.Warn("execenv: codex-home ensure sandbox config failed", "error", err)
+	}
+
+	// Disable Codex native multi-agent inside daemon-managed task sessions
+	// so the parent thread's `turn/completed` is not interpreted as task
+	// completion while spawned subagents are still running. See
+	// codex_multi_agent.go for the full rationale and escape hatch.
+	if err := ensureCodexMultiAgentConfig(filepath.Join(codexHome, "config.toml"), logger); err != nil {
+		logger.Warn("execenv: codex-home ensure multi-agent config failed", "error", err)
 	}
 
 	return nil
@@ -114,6 +136,38 @@ func resolveSharedCodexHome() string {
 		return filepath.Join(os.TempDir(), ".codex") // last resort fallback
 	}
 	return filepath.Join(home, ".codex")
+}
+
+func exposeSharedCodexPluginCache(codexHome, sharedHome string) error {
+	src := filepath.Join(sharedHome, "plugins", "cache")
+	dst := filepath.Join(codexHome, "plugins", "cache")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		return fmt.Errorf("create shared plugin cache dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("create codex plugin dir: %w", err)
+	}
+
+	if fi, err := os.Lstat(dst); err == nil {
+		isLink := fi.Mode()&os.ModeSymlink != 0
+		if isLink {
+			if target, readlinkErr := os.Readlink(dst); readlinkErr == nil && target == src {
+				return nil
+			}
+			if err := os.Remove(dst); err != nil {
+				return fmt.Errorf("remove stale plugin cache link: %w", err)
+			}
+		} else {
+			if err := os.RemoveAll(dst); err != nil {
+				return fmt.Errorf("remove stale plugin cache path: %w", err)
+			}
+		}
+	}
+
+	if err := createDirLink(src, dst); err != nil {
+		return fmt.Errorf("expose shared plugin cache: %w", err)
+	}
+	return nil
 }
 
 // ensureDirSymlink creates a symlink dst → src for a directory.
@@ -172,7 +226,6 @@ func ensureSymlink(src, dst string) error {
 // sandbox/network directives now live in a managed block rendered by
 // codex_sandbox.go's ensureCodexSandboxConfig so they can be updated
 // idempotently without touching user-managed keys.)
-
 
 // copyFileIfExists copies src to dst. If src doesn't exist, it's a no-op.
 // If dst already exists, it's not overwritten.

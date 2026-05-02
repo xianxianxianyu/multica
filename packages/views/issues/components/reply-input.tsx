@@ -1,9 +1,10 @@
 "use client";
 
-import { useRef, useState, useEffect, useCallback } from "react";
-import { ArrowUp, Loader2 } from "lucide-react";
+import { useRef, useState, useCallback } from "react";
+import { ArrowUp, Loader2, Maximize2, Minimize2 } from "lucide-react";
 import { ContentEditor, type ContentEditorRef, useFileDropZone, FileDropOverlay } from "../../editor";
 import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@multica/ui/components/ui/tooltip";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { useFileUpload } from "@multica/core/hooks/use-file-upload";
 import { api } from "@multica/core/api";
@@ -35,7 +36,6 @@ function ReplyInput({
   size = "default",
 }: ReplyInputProps) {
   const editorRef = useRef<ContentEditorRef>(null);
-  const measureRef = useRef<HTMLDivElement>(null);
   const [isEmpty, setIsEmpty] = useState(true);
   const [isExpanded, setIsExpanded] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -44,17 +44,6 @@ function ReplyInput({
   const { isDragOver, dropZoneProps } = useFileDropZone({
     onDrop: (files) => files.forEach((f) => editorRef.current?.uploadFile(f)),
   });
-
-  useEffect(() => {
-    const el = measureRef.current;
-    if (!el) return;
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (entry) setIsExpanded(entry.contentRect.height > 32);
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
 
   const handleUpload = useCallback(async (file: File) => {
     const result = await uploadWithToast(file, { issueId });
@@ -97,23 +86,41 @@ function ReplyInput({
         {...dropZoneProps}
         className={cn(
           "relative min-w-0 flex-1 flex flex-col",
-          size === "sm" ? "max-h-40" : "max-h-56",
-          isExpanded && "pb-7",
+          isExpanded
+            ? "h-[60vh]"
+            : size === "sm" ? "max-h-40" : "max-h-56",
+          (!isEmpty || isExpanded) && "pb-7",
         )}
       >
-        <div className="flex-1 min-h-0 overflow-y-auto pr-14">
-          <div ref={measureRef}>
-            <ContentEditor
-              ref={editorRef}
-              placeholder={placeholder}
-              onUpdate={(md) => setIsEmpty(!md.trim())}
-              onSubmit={handleSubmit}
-              onUploadFile={handleUpload}
-              debounceMs={100}
-            />
-          </div>
+        <div className="flex-1 min-h-0 overflow-y-auto">
+          <ContentEditor
+            ref={editorRef}
+            placeholder={placeholder}
+            onUpdate={(md) => setIsEmpty(!md.trim())}
+            onSubmit={handleSubmit}
+            onUploadFile={handleUpload}
+            debounceMs={100}
+            currentIssueId={issueId}
+          />
         </div>
-        <div className="absolute bottom-0 right-0 flex items-center gap-1 text-muted-foreground transition-colors group-focus-within/editor:text-foreground">
+        <div className="absolute bottom-0 right-0 flex items-center gap-1">
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsExpanded((v) => !v);
+                    editorRef.current?.focus();
+                  }}
+                  className="inline-flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground opacity-70 hover:opacity-100 hover:bg-accent/60 transition-all cursor-pointer"
+                >
+                  {isExpanded ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+                </button>
+              }
+            />
+            <TooltipContent side="top">{isExpanded ? "Collapse" : "Expand"}</TooltipContent>
+          </Tooltip>
           <FileUploadButton
             size="sm"
             onSelect={(file) => editorRef.current?.uploadFile(file)}

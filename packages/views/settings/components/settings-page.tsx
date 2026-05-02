@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { User, Palette, Key, Settings, Users, FolderGit2 } from "lucide-react";
+import { User, Palette, Key, Settings, Users, FolderGit2, FlaskConical, Bell } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@multica/ui/components/ui/tabs";
 import { useCurrentWorkspace } from "@multica/core/paths";
 import { AccountTab } from "./account-tab";
@@ -10,16 +10,20 @@ import { TokensTab } from "./tokens-tab";
 import { WorkspaceTab } from "./workspace-tab";
 import { MembersTab } from "./members-tab";
 import { RepositoriesTab } from "./repositories-tab";
+import { LabsTab } from "./labs-tab";
+import { NotificationsTab } from "./notifications-tab";
 
 const accountTabs = [
   { value: "profile", label: "Profile", icon: User },
   { value: "appearance", label: "Appearance", icon: Palette },
+  { value: "notifications", label: "Notifications", icon: Bell },
   { value: "tokens", label: "API Tokens", icon: Key },
 ];
 
 const workspaceTabs = [
   { value: "workspace", label: "General", icon: Settings },
   { value: "repositories", label: "Repositories", icon: FolderGit2 },
+  { value: "labs", label: "Labs", icon: FlaskConical },
   { value: "members", label: "Members", icon: Users },
 ];
 
@@ -79,9 +83,11 @@ export function SettingsPage({ extraAccountTabs }: SettingsPageProps = {}) {
         <div className="w-full max-w-3xl mx-auto p-6">
           <TabsContent value="profile"><AccountTab /></TabsContent>
           <TabsContent value="appearance"><AppearanceTab /></TabsContent>
+          <TabsContent value="notifications"><NotificationsTab /></TabsContent>
           <TabsContent value="tokens"><TokensTab /></TabsContent>
           <TabsContent value="workspace"><WorkspaceTab /></TabsContent>
           <TabsContent value="repositories"><RepositoriesTab /></TabsContent>
+          <TabsContent value="labs"><LabsTab /></TabsContent>
           <TabsContent value="members"><MembersTab /></TabsContent>
           {extraAccountTabs?.map((tab) => (
             <TabsContent key={tab.value} value={tab.value}>{tab.content}</TabsContent>

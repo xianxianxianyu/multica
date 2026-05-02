@@ -58,6 +58,27 @@ func clearTasks(t *testing.T, issueID string) {
 	}
 }
 
+// latestTriggerCommentID returns the trigger_comment_id of the most recently
+// created queued/dispatched task for the given issue, or empty string if none.
+func latestTriggerCommentID(t *testing.T, issueID string) string {
+	t.Helper()
+	var triggerID *string
+	err := testPool.QueryRow(context.Background(),
+		`SELECT trigger_comment_id::text
+		   FROM agent_task_queue
+		  WHERE issue_id = $1 AND status IN ('queued', 'dispatched')
+		  ORDER BY created_at DESC
+		  LIMIT 1`,
+		issueID).Scan(&triggerID)
+	if err != nil {
+		t.Fatalf("failed to fetch trigger_comment_id: %v", err)
+	}
+	if triggerID == nil {
+		return ""
+	}
+	return *triggerID
+}
+
 // getAgentID returns the ID of the first agent in the test workspace.
 func getAgentID(t *testing.T) string {
 	t.Helper()
@@ -225,6 +246,25 @@ func TestCommentTriggerOnComment(t *testing.T) {
 		postComment(t, issueID, "Looks good, please proceed", strPtr(threadID))
 		if n := countPendingTasks(t, issueID); n != 1 {
 			t.Errorf("expected 1 pending task, got %d", n)
+		}
+	})
+
+	// Regression guard for #1301: the assignee on_comment path must record
+	// the NEW reply as trigger_comment_id, not the thread root. Otherwise
+	// the daemon feeds stale content to the agent prompt, which with
+	// `--resume` sessions surfaces as "already replied, no further action".
+	// Reply placement (flat-thread grouping) is handled downstream in
+	// TaskService.createAgentComment, not here.
+	t.Run("reply records new comment id (not thread root) as trigger_comment_id", func(t *testing.T) {
+		clearTasks(t, issueID)
+		threadID := postCommentAsAgent(t, issueID, "First pass analysis.", agentID, nil)
+		replyID := postComment(t, issueID, "Please also check the edge case", strPtr(threadID))
+		if n := countPendingTasks(t, issueID); n != 1 {
+			t.Fatalf("expected 1 pending task, got %d", n)
+		}
+		if got := latestTriggerCommentID(t, issueID); got != replyID {
+			t.Errorf("trigger_comment_id = %q, want reply id %q (thread root was %q)",
+				got, replyID, threadID)
 		}
 	})
 
@@ -468,6 +508,41 @@ func TestCommentTriggerThreadInheritedMention(t *testing.T) {
 		postComment(t, issueID, reply, strPtr(threadID))
 		if n := countPendingTasks(t, issueID); n != 1 {
 			t.Errorf("expected 1 pending task (reply mentions agent explicitly), got %d", n)
+		}
+	})
+}
+
+// TestDeleteCommentCancelsTriggeredTasks verifies that deleting a comment
+// also cancels any active tasks that were triggered by it. Without this,
+// the daemon would still claim the queued task after the FK SET NULL
+// nullified its trigger_comment_id, and the agent would either run with a
+// stale prompt (race during claim) or with a generic "you are assigned"
+// prompt that has no record of the now-deleted user request — both of
+// which manifest as "the agent still sees the deleted comment".
+func TestDeleteCommentCancelsTriggeredTasks(t *testing.T) {
+	agentID := getAgentID(t)
+	issueID := createIssueAssignedToAgent(t, "Delete-comment cancels task test", agentID)
+	t.Cleanup(func() {
+		clearTasks(t, issueID)
+		resp := authRequest(t, "DELETE", "/api/issues/"+issueID, nil)
+		resp.Body.Close()
+	})
+
+	t.Run("deleting trigger comment cancels its queued task", func(t *testing.T) {
+		clearTasks(t, issueID)
+		commentID := postComment(t, issueID, "Please fix this bug", nil)
+		if n := countPendingTasks(t, issueID); n != 1 {
+			t.Fatalf("expected 1 pending task before delete, got %d", n)
+		}
+
+		resp := authRequest(t, "DELETE", "/api/comments/"+commentID, nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("DeleteComment: expected 204, got %d", resp.StatusCode)
+		}
+
+		if n := countPendingTasks(t, issueID); n != 0 {
+			t.Errorf("expected 0 pending tasks after deleting trigger comment, got %d", n)
 		}
 	})
 }

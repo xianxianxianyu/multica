@@ -22,9 +22,9 @@ func (q *Queries) ArchiveChatSession(ctx context.Context, id pgtype.UUID) error 
 }
 
 const createChatMessage = `-- name: CreateChatMessage :one
-INSERT INTO chat_message (chat_session_id, role, content, task_id)
-VALUES ($1, $2, $3, $4)
-RETURNING id, chat_session_id, role, content, task_id, created_at
+INSERT INTO chat_message (chat_session_id, role, content, task_id, failure_reason, elapsed_ms)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, chat_session_id, role, content, task_id, created_at, failure_reason, elapsed_ms
 `
 
 type CreateChatMessageParams struct {
@@ -32,6 +32,8 @@ type CreateChatMessageParams struct {
 	Role          string      `json:"role"`
 	Content       string      `json:"content"`
 	TaskID        pgtype.UUID `json:"task_id"`
+	FailureReason pgtype.Text `json:"failure_reason"`
+	ElapsedMs     pgtype.Int8 `json:"elapsed_ms"`
 }
 
 func (q *Queries) CreateChatMessage(ctx context.Context, arg CreateChatMessageParams) (ChatMessage, error) {
@@ -40,6 +42,8 @@ func (q *Queries) CreateChatMessage(ctx context.Context, arg CreateChatMessagePa
 		arg.Role,
 		arg.Content,
 		arg.TaskID,
+		arg.FailureReason,
+		arg.ElapsedMs,
 	)
 	var i ChatMessage
 	err := row.Scan(
@@ -49,6 +53,8 @@ func (q *Queries) CreateChatMessage(ctx context.Context, arg CreateChatMessagePa
 		&i.Content,
 		&i.TaskID,
 		&i.CreatedAt,
+		&i.FailureReason,
+		&i.ElapsedMs,
 	)
 	return i, err
 }
@@ -93,7 +99,7 @@ func (q *Queries) CreateChatSession(ctx context.Context, arg CreateChatSessionPa
 const createChatTask = `-- name: CreateChatTask :one
 INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, chat_session_id)
 VALUES ($1, $2, NULL, 'queued', $3, $4)
-RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, last_heartbeat_at, trigger_summary, force_fresh_session
 `
 
 type CreateChatTaskParams struct {
@@ -130,12 +136,19 @@ func (q *Queries) CreateChatTask(ctx context.Context, arg CreateChatTaskParams) 
 		&i.TriggerCommentID,
 		&i.ChatSessionID,
 		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.LastHeartbeatAt,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
 	)
 	return i, err
 }
 
 const getChatMessage = `-- name: GetChatMessage :one
-SELECT id, chat_session_id, role, content, task_id, created_at FROM chat_message
+SELECT id, chat_session_id, role, content, task_id, created_at, failure_reason, elapsed_ms FROM chat_message
 WHERE id = $1
 `
 
@@ -149,6 +162,8 @@ func (q *Queries) GetChatMessage(ctx context.Context, id pgtype.UUID) (ChatMessa
 		&i.Content,
 		&i.TaskID,
 		&i.CreatedAt,
+		&i.FailureReason,
+		&i.ElapsedMs,
 	)
 	return i, err
 }
@@ -208,7 +223,9 @@ func (q *Queries) GetChatSessionInWorkspace(ctx context.Context, arg GetChatSess
 
 const getLastChatTaskSession = `-- name: GetLastChatTaskSession :one
 SELECT session_id, work_dir FROM agent_task_queue
-WHERE chat_session_id = $1 AND status = 'completed' AND session_id IS NOT NULL
+WHERE chat_session_id = $1
+  AND status IN ('completed', 'failed')
+  AND session_id IS NOT NULL
 ORDER BY completed_at DESC
 LIMIT 1
 `
@@ -218,6 +235,11 @@ type GetLastChatTaskSessionRow struct {
 	WorkDir   pgtype.Text `json:"work_dir"`
 }
 
+// Returns the most recent task in this chat session that managed to record a
+// session_id. Includes both completed and failed tasks: even a failed task
+// may have established a real agent session before failing, and we'd rather
+// resume there than start over and lose conversation memory. Used as a
+// fallback when chat_session.session_id is NULL.
 func (q *Queries) GetLastChatTaskSession(ctx context.Context, chatSessionID pgtype.UUID) (GetLastChatTaskSessionRow, error) {
 	row := q.db.QueryRow(ctx, getLastChatTaskSession, chatSessionID)
 	var i GetLastChatTaskSessionRow
@@ -226,23 +248,27 @@ func (q *Queries) GetLastChatTaskSession(ctx context.Context, chatSessionID pgty
 }
 
 const getPendingChatTask = `-- name: GetPendingChatTask :one
-SELECT id, status FROM agent_task_queue
+SELECT id, status, created_at FROM agent_task_queue
 WHERE chat_session_id = $1 AND status IN ('queued', 'dispatched', 'running')
 ORDER BY created_at DESC
 LIMIT 1
 `
 
 type GetPendingChatTaskRow struct {
-	ID     pgtype.UUID `json:"id"`
-	Status string      `json:"status"`
+	ID        pgtype.UUID        `json:"id"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 // Returns the most recent in-flight task for a chat session, if any.
 // Used by the frontend to recover pending state after refresh / reopen.
+// created_at is the anchor for the chat StatusPill timer (it computes
+// elapsed = now - task.created_at), so the pill survives refresh / reopen
+// without "resetting to 0s".
 func (q *Queries) GetPendingChatTask(ctx context.Context, chatSessionID pgtype.UUID) (GetPendingChatTaskRow, error) {
 	row := q.db.QueryRow(ctx, getPendingChatTask, chatSessionID)
 	var i GetPendingChatTaskRow
-	err := row.Scan(&i.ID, &i.Status)
+	err := row.Scan(&i.ID, &i.Status, &i.CreatedAt)
 	return i, err
 }
 
@@ -308,7 +334,7 @@ func (q *Queries) ListAllChatSessionsByCreator(ctx context.Context, arg ListAllC
 }
 
 const listChatMessages = `-- name: ListChatMessages :many
-SELECT id, chat_session_id, role, content, task_id, created_at FROM chat_message
+SELECT id, chat_session_id, role, content, task_id, created_at, failure_reason, elapsed_ms FROM chat_message
 WHERE chat_session_id = $1
 ORDER BY created_at ASC
 `
@@ -329,6 +355,8 @@ func (q *Queries) ListChatMessages(ctx context.Context, chatSessionID pgtype.UUI
 			&i.Content,
 			&i.TaskID,
 			&i.CreatedAt,
+			&i.FailureReason,
+			&i.ElapsedMs,
 		); err != nil {
 			return nil, err
 		}
@@ -483,18 +511,26 @@ func (q *Queries) TouchChatSession(ctx context.Context, id pgtype.UUID) error {
 }
 
 const updateChatSessionSession = `-- name: UpdateChatSessionSession :exec
-UPDATE chat_session SET session_id = $2, work_dir = $3, updated_at = now()
-WHERE id = $1
+UPDATE chat_session
+SET session_id = COALESCE($1, session_id),
+    work_dir = COALESCE($2, work_dir),
+    updated_at = now()
+WHERE id = $3
 `
 
 type UpdateChatSessionSessionParams struct {
-	ID        pgtype.UUID `json:"id"`
 	SessionID pgtype.Text `json:"session_id"`
 	WorkDir   pgtype.Text `json:"work_dir"`
+	ID        pgtype.UUID `json:"id"`
 }
 
+// Updates the resume pointer for a chat session. Empty/NULL inputs are
+// ignored via COALESCE so a task that completes without a session_id (e.g.
+// the agent crashed before establishing one) cannot wipe out a previously
+// recorded resume pointer. This makes the chat memory robust against
+// intermittent agent failures.
 func (q *Queries) UpdateChatSessionSession(ctx context.Context, arg UpdateChatSessionSessionParams) error {
-	_, err := q.db.Exec(ctx, updateChatSessionSession, arg.ID, arg.SessionID, arg.WorkDir)
+	_, err := q.db.Exec(ctx, updateChatSessionSession, arg.SessionID, arg.WorkDir, arg.ID)
 	return err
 }
 

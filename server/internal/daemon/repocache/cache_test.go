@@ -44,6 +44,65 @@ func TestGitEnv(t *testing.T) {
 	if !foundHome {
 		t.Error("gitEnv() must include HOME from os.Environ()")
 	}
+
+	// Must set safe.directory=* via GIT_CONFIG env vars.
+	envHas := func(env []string, want string) bool {
+		for _, e := range env {
+			if e == want {
+				return true
+			}
+		}
+		return false
+	}
+	if !envHas(env, "GIT_CONFIG_KEY_0=safe.directory") {
+		t.Error("gitEnv() must include GIT_CONFIG_KEY_0=safe.directory (no pre-existing config)")
+	}
+	if !envHas(env, "GIT_CONFIG_VALUE_0=*") {
+		t.Error("gitEnv() must include GIT_CONFIG_VALUE_0=*")
+	}
+}
+
+func TestGitEnvPreservesExistingConfig(t *testing.T) {
+	// GIT_CONFIG_COUNT env vars are process-wide; cannot use t.Setenv in
+	// parallel tests, so run sequentially.
+	t.Setenv("GIT_CONFIG_COUNT", "2")
+	t.Setenv("GIT_CONFIG_KEY_0", "url.https://github.com/.insteadOf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "gh:")
+	t.Setenv("GIT_CONFIG_KEY_1", "http.extraHeader")
+	t.Setenv("GIT_CONFIG_VALUE_1", "Authorization: Bearer tok")
+
+	env := gitEnv()
+
+	envHas := func(want string) bool {
+		for _, e := range env {
+			if e == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// safe.directory must be appended at index 2 (next available).
+	if !envHas("GIT_CONFIG_COUNT=3") {
+		t.Error("expected GIT_CONFIG_COUNT=3")
+	}
+	if !envHas("GIT_CONFIG_KEY_2=safe.directory") {
+		t.Error("expected GIT_CONFIG_KEY_2=safe.directory")
+	}
+	if !envHas("GIT_CONFIG_VALUE_2=*") {
+		t.Error("expected GIT_CONFIG_VALUE_2=*")
+	}
+
+	// Original entries must still be present.
+	if !envHas("GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf") {
+		t.Error("existing GIT_CONFIG_KEY_0 was lost")
+	}
+	if !envHas("GIT_CONFIG_VALUE_0=gh:") {
+		t.Error("existing GIT_CONFIG_VALUE_0 was lost")
+	}
+	if !envHas("GIT_CONFIG_KEY_1=http.extraHeader") {
+		t.Error("existing GIT_CONFIG_KEY_1 was lost")
+	}
 }
 
 func TestBareDirName(t *testing.T) {
@@ -51,17 +110,83 @@ func TestBareDirName(t *testing.T) {
 	tests := []struct {
 		input, want string
 	}{
-		{"https://github.com/org/my-repo.git", "my-repo.git"},
-		{"https://github.com/org/my-repo", "my-repo.git"},
-		{"git@github.com:org/my-repo.git", "my-repo.git"},
-		{"git@github.com:org/my-repo", "my-repo.git"},
-		{"https://github.com/org/repo/", "repo.git"},
+		{"https://github.com/org/my-repo.git", "github.com+org+my-repo.git"},
+		{"https://github.com/org/my-repo", "github.com+org+my-repo.git"},
+		{"git@github.com:org/my-repo.git", "github.com+org+my-repo.git"},
+		{"git@github.com:org/my-repo", "github.com+org+my-repo.git"},
+		{"https://github.com/org/repo/", "github.com+org+repo.git"},
+		{"ssh://git@gitlab.example.com:22/group/sub/repo.git", "gitlab.example.com%3A22+group+sub+repo.git"},
+		// Basename collision: two repos sharing the basename must produce
+		// distinct dirs (the original bug).
+		{"ssh://git@gitlab.example.com:22/relisty/app.git", "gitlab.example.com%3A22+relisty+app.git"},
+		{"ssh://git@gitlab.example.com:22/listbridge/app.git", "gitlab.example.com%3A22+listbridge+app.git"},
 		{"my-repo", "my-repo.git"},
 		{"", "repo.git"},
 	}
 	for _, tt := range tests {
 		if got := bareDirName(tt.input); got != tt.want {
 			t.Errorf("bareDirName(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// TestBareDirNameDistinctsSegmentBoundaryColliders covers the collision class
+// that a naive path-flattening-with-dashes scheme would miss: two repos whose
+// path segments differ only at a segment boundary flatten to the same string
+// once slashes become dashes. The '+' separator can't appear inside a
+// GitHub/GitLab path segment, so the boundary stays visible in the output.
+func TestBareDirNameDistinctsSegmentBoundaryColliders(t *testing.T) {
+	t.Parallel()
+	pairs := [][2]string{
+		{"git@github.com:foo/bar-baz.git", "git@github.com:foo-bar/baz.git"},
+		{"https://github.com/foo/bar-baz.git", "https://github.com/foo-bar/baz.git"},
+	}
+	for _, p := range pairs {
+		a, b := bareDirName(p[0]), bareDirName(p[1])
+		if a == b {
+			t.Errorf("bareDirName collision: %q and %q both → %q", p[0], p[1], a)
+		}
+	}
+}
+
+// TestBareDirNameDistinctsSameRepoNameAcrossHosts covers the cross-host
+// collision class: the same path-with-namespace on different hosts must
+// produce distinct cache dirs so an agent configured for host A can't be
+// served the clone from host B.
+func TestBareDirNameDistinctsSameRepoNameAcrossHosts(t *testing.T) {
+	t.Parallel()
+	pairs := [][2]string{
+		{"git@github.com:org/repo.git", "git@gitlab.example.com:org/repo.git"},
+		{"https://github.com/org/repo.git", "https://gitlab.example.com/org/repo.git"},
+		{"ssh://git@github.com/org/repo.git", "ssh://git@gitlab.example.com/org/repo.git"},
+	}
+	for _, p := range pairs {
+		a, b := bareDirName(p[0]), bareDirName(p[1])
+		if a == b {
+			t.Errorf("bareDirName collision across hosts: %q and %q both → %q", p[0], p[1], a)
+		}
+	}
+}
+
+// TestBareDirNameDistinctsHostPortFromDashedHostname covers the lossy-port
+// encoding regression: a naive ':' -> '-' rewrite would collapse
+// `host:port` onto a hostname that literally contains the same dash pattern,
+// silently reintroducing the wrong-remote bug. We URL-encode ':' to '%3A'
+// so host+port is lossless — and '%' is forbidden in valid hostnames so the
+// marker can never come from a legal literal hostname.
+func TestBareDirNameDistinctsHostPortFromDashedHostname(t *testing.T) {
+	t.Parallel()
+	pairs := [][2]string{
+		// Host-with-port vs a literal hostname that looks like `host-port`.
+		{"ssh://git@gitlab.example.com:22/org/repo.git", "git@gitlab.example.com-22:org/repo.git"},
+		// Same again but across the URL and scp-style forms, explicit ports
+		// swapped to ensure we don't rely on order.
+		{"ssh://git@host.example.com:443/a/b.git", "git@host.example.com-443:a/b.git"},
+	}
+	for _, p := range pairs {
+		a, b := bareDirName(p[0]), bareDirName(p[1])
+		if a == b {
+			t.Errorf("bareDirName collision between host:port and host-port: %q and %q both → %q", p[0], p[1], a)
 		}
 	}
 }
@@ -86,7 +211,14 @@ func TestIsBareRepo(t *testing.T) {
 // createTestRepo creates a local git repo with an initial commit and returns its path.
 func createTestRepo(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	return createTestRepoAt(t, t.TempDir())
+}
+
+// createTestRepoAt initializes a git repo at the given directory (which
+// must already exist). Used to craft repo URLs at paths chosen by the test
+// — e.g. to reproduce collision classes in name derivation.
+func createTestRepoAt(t *testing.T, dir string) string {
+	t.Helper()
 	for _, args := range [][]string{
 		{"init", dir},
 		{"-C", dir, "commit", "--allow-empty", "-m", "initial"},
@@ -112,7 +244,7 @@ func TestSyncAndLookup(t *testing.T) {
 
 	// Sync should clone the repo.
 	err := cache.Sync("ws-123", []RepoInfo{
-		{URL: sourceRepo, Description: "test repo"},
+		{URL: sourceRepo},
 	})
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
@@ -136,6 +268,110 @@ func TestSyncAndLookup(t *testing.T) {
 	if got := cache.Lookup("ws-999", sourceRepo); got != "" {
 		t.Fatalf("expected empty for unknown workspace, got %q", got)
 	}
+}
+
+// TestSyncKeepsDistinctCachesForSegmentBoundaryColliders proves that two
+// URLs differing only at a path-segment boundary don't share a bare cache
+// and don't silently reuse each other's origin. Both conditions would have
+// failed under a plain slashes-to-dashes flattening scheme: the two URLs
+// in this test produce the same dash-joined key even though they point at
+// different source repositories.
+func TestSyncKeepsDistinctCachesForSegmentBoundaryColliders(t *testing.T) {
+	t.Parallel()
+
+	// Build two real source repos under a shared parent. Their filesystem
+	// paths are used directly as URLs (git accepts local paths as remote
+	// URLs). The path pair ".../foo/bar-baz" and ".../foo-bar/baz" would
+	// flatten to the same string under slashes-to-dashes — that's the
+	// class of collision we want to rule out.
+	parent := t.TempDir()
+	srcA := filepath.Join(parent, "foo", "bar-baz")
+	srcB := filepath.Join(parent, "foo-bar", "baz")
+	if err := os.MkdirAll(srcA, 0o755); err != nil {
+		t.Fatalf("mkdir srcA: %v", err)
+	}
+	if err := os.MkdirAll(srcB, 0o755); err != nil {
+		t.Fatalf("mkdir srcB: %v", err)
+	}
+	createTestRepoAt(t, srcA)
+	createTestRepoAt(t, srcB)
+	// Distinct content so a silent-reuse bug would produce the wrong file
+	// in the wrong cache.
+	if err := os.WriteFile(filepath.Join(srcA, "A.txt"), []byte("A\n"), 0o644); err != nil {
+		t.Fatalf("write A: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcB, "B.txt"), []byte("B\n"), 0o644); err != nil {
+		t.Fatalf("write B: %v", err)
+	}
+	runGitAuthored(t, srcA, "add", ".")
+	runGitAuthored(t, srcA, "commit", "-m", "A-content")
+	runGitAuthored(t, srcB, "add", ".")
+	runGitAuthored(t, srcB, "commit", "-m", "B-content")
+
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: srcA}, {URL: srcB}}); err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	pathA := cache.Lookup("ws-1", srcA)
+	pathB := cache.Lookup("ws-1", srcB)
+	if pathA == "" || pathB == "" {
+		t.Fatalf("missing cache entry: A=%q B=%q", pathA, pathB)
+	}
+	if pathA == pathB {
+		t.Fatalf("collider URLs share a bare cache path: %s", pathA)
+	}
+
+	// Each bare cache must carry the origin URL of the repo it was
+	// cloned from — not the other one's. A silent-reuse bug would have
+	// both caches pointing at whichever URL won the race in Sync.
+	if got := gitConfigGet(t, pathA, "remote.origin.url"); got != srcA {
+		t.Errorf("cacheA origin.url = %q, want %q", got, srcA)
+	}
+	if got := gitConfigGet(t, pathB, "remote.origin.url"); got != srcB {
+		t.Errorf("cacheB origin.url = %q, want %q", got, srcB)
+	}
+
+	// And each cache's content must reflect the right source.
+	if !cachedRepoHasFile(t, pathA, "A.txt") {
+		t.Errorf("cacheA (%s) should contain A.txt from srcA", pathA)
+	}
+	if !cachedRepoHasFile(t, pathB, "B.txt") {
+		t.Errorf("cacheB (%s) should contain B.txt from srcB", pathB)
+	}
+}
+
+// gitConfigGet reads a git config value from repoPath. Fails the test if
+// the key is missing or the command errors.
+func gitConfigGet(t *testing.T, repoPath, key string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", repoPath, "config", "--get", key).Output()
+	if err != nil {
+		t.Fatalf("git config --get %s in %s: %v", key, repoPath, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// cachedRepoHasFile returns true if the bare cache at barePath exposes a
+// file named filename anywhere in its remote-tracking default branch.
+// Walks refs/remotes/origin/* since a bare clone stores fetched heads
+// there under the modern refspec.
+func cachedRepoHasFile(t *testing.T, barePath, filename string) bool {
+	t.Helper()
+	ref := getRemoteDefaultBranch(barePath)
+	if ref == "" {
+		return false
+	}
+	out, err := exec.Command("git", "-C", barePath, "ls-tree", "-r", "--name-only", ref).Output()
+	if err != nil {
+		t.Fatalf("git ls-tree %s in %s: %v", ref, barePath, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.TrimSpace(line) == filename {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSyncFetchesExisting(t *testing.T) {
@@ -703,6 +939,97 @@ func TestGetRemoteDefaultBranchUsesBareHeadHintForCustomDefault(t *testing.T) {
 	got := getRemoteDefaultBranch(barePath)
 	if got != "refs/remotes/origin/trunk" {
 		t.Fatalf("getRemoteDefaultBranch = %q, want refs/remotes/origin/trunk (via bare-HEAD hint)", got)
+	}
+}
+
+// TestCreateWorktreeInstallsCoAuthoredByHook verifies that CreateWorktree
+// installs a prepare-commit-msg hook that appends a Co-authored-by trailer
+// for the Multica Agent to every commit made in the worktree.
+func TestCreateWorktreeInstallsCoAuthoredByHook(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cacheRoot := t.TempDir()
+
+	cache := New(cacheRoot, testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	workDir := t.TempDir()
+	result, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID:        "ws-1",
+		RepoURL:            sourceRepo,
+		WorkDir:            workDir,
+		AgentName:          "Test Agent",
+		TaskID:             "a1b2c3d4-0000-0000-0000-000000000000",
+		CoAuthoredByEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+
+	// Make a commit in the worktree and verify the hook appends the trailer.
+	if err := os.WriteFile(filepath.Join(result.Path, "test.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	runGitAuthored(t, result.Path, "add", ".")
+	runGitAuthored(t, result.Path, "commit", "-m", "test commit")
+
+	// Read the commit message.
+	out, err := exec.Command("git", "-C", result.Path, "log", "-1", "--format=%B").Output()
+	if err != nil {
+		t.Fatalf("git log failed: %v", err)
+	}
+	commitMsg := string(out)
+	expectedTrailer := "Co-authored-by: multica-agent <github@multica.ai>"
+	if !strings.Contains(commitMsg, expectedTrailer) {
+		t.Errorf("commit message missing Co-authored-by trailer.\ngot:\n%s", commitMsg)
+	}
+}
+
+// TestCoAuthoredByHookIdempotent verifies that the hook does not add a
+// duplicate Co-authored-by trailer if one is already present in the message.
+func TestCoAuthoredByHookIdempotent(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cacheRoot := t.TempDir()
+
+	cache := New(cacheRoot, testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	workDir := t.TempDir()
+	result, err := cache.CreateWorktree(WorktreeParams{
+		WorkspaceID:        "ws-1",
+		RepoURL:            sourceRepo,
+		WorkDir:            workDir,
+		AgentName:          "Test Agent",
+		TaskID:             "b2c3d4e5-0000-0000-0000-000000000000",
+		CoAuthoredByEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+
+	// Commit with the trailer already in the message.
+	trailer := "Co-authored-by: multica-agent <github@multica.ai>"
+	if err := os.WriteFile(filepath.Join(result.Path, "test.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	runGitAuthored(t, result.Path, "add", ".")
+	runGitAuthored(t, result.Path, "commit", "-m", "test commit\n\n"+trailer)
+
+	out, err := exec.Command("git", "-C", result.Path, "log", "-1", "--format=%B").Output()
+	if err != nil {
+		t.Fatalf("git log failed: %v", err)
+	}
+	commitMsg := string(out)
+
+	// Count occurrences — should appear exactly once.
+	count := strings.Count(commitMsg, trailer)
+	if count != 1 {
+		t.Errorf("expected exactly 1 Co-authored-by trailer, found %d.\ngot:\n%s", count, commitMsg)
 	}
 }
 

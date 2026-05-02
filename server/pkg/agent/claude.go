@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -59,7 +60,8 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 	}()
 
 	cmd := exec.CommandContext(runCtx, execPath, args...)
-	b.cfg.Logger.Debug("agent command", "exec", execPath, "args", args)
+	hideAgentWindow(cmd)
+	b.cfg.Logger.Info("agent command", "exec", execPath, "args", args)
 	cmd.WaitDelay = 10 * time.Second
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -82,7 +84,13 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			stdin = nil
 		}
 	}
-	cmd.Stderr = newLogWriter(b.cfg.Logger, "[claude:stderr] ")
+	// Capture stderr into both the daemon log (as before) and a bounded tail
+	// buffer so we can include the last few KB in Result.Error when claude
+	// exits unexpectedly. Without the tail, an exit-code-only failure looks
+	// like "claude exited with error: exit status 3" — which is useless for
+	// root-causing V8 aborts, Bun panics, or any other CLI-side crash.
+	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[claude:stderr] "), agentStderrTailBytes)
+	cmd.Stderr = stderrBuf
 
 	if err := cmd.Start(); err != nil {
 		closeStdin()
@@ -90,10 +98,16 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 		return nil, fmt.Errorf("start claude: %w", err)
 	}
 	if err := writeClaudeInput(stdin, prompt); err != nil {
+		// claude almost certainly died during startup (broken pipe). The
+		// real reason is sitting in stderrBuf — surface it the same way the
+		// post-handshake error path does, otherwise the daemon log is the
+		// only place that knows whether it was a V8 abort, a missing native
+		// module, or anything else. cmd.Wait() flushes os/exec's stderr
+		// copy goroutine, so stderrBuf.Tail() is safe to read.
 		closeStdin()
 		cancel()
 		_ = cmd.Wait()
-		return nil, fmt.Errorf("write claude input: %w", err)
+		return nil, errors.New(withAgentStderr(fmt.Sprintf("write claude input: %v", err), "claude", stderrBuf.Tail()))
 	}
 	closeStdin()
 
@@ -149,7 +163,7 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 				if msg.SessionID != "" {
 					sessionID = msg.SessionID
 				}
-				trySend(msgCh, Message{Type: MessageStatus, Status: "running"})
+				trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: sessionID})
 			case "result":
 				closeStdin()
 				sessionID = msg.SessionID
@@ -187,14 +201,31 @@ func (b *claudeBackend) Execute(ctx context.Context, prompt string, opts ExecOpt
 			finalError = fmt.Sprintf("claude exited with error: %v", exitErr)
 		}
 
+		// cmd.Wait() has returned — os/exec's stderr copy goroutine has
+		// observed every byte claude wrote to stderr before exiting, so
+		// stderrBuf.Tail() is safe to sample now. Attach the tail to any
+		// non-empty failure message; callers upstream surface this as the
+		// task's error field, which is the only place users see it.
+		if finalError != "" {
+			finalError = withAgentStderr(finalError, "claude", stderrBuf.Tail())
+		}
+
 		b.cfg.Logger.Info("claude finished", "pid", cmd.Process.Pid, "status", finalStatus, "duration", duration.Round(time.Millisecond).String())
+
+		reportedSessionID := resolveSessionID(opts.ResumeSessionID, sessionID, finalStatus == "failed")
+		if reportedSessionID != sessionID {
+			b.cfg.Logger.Info("claude resume did not land; clearing fresh session id for daemon fallback",
+				"requested_resume", opts.ResumeSessionID,
+				"emitted_session", sessionID,
+			)
+		}
 
 		resCh <- Result{
 			Status:     finalStatus,
 			Output:     output.String(),
 			Error:      finalError,
 			DurationMs: duration.Milliseconds(),
-			SessionID:  sessionID,
+			SessionID:  reportedSessionID,
 			Usage:      usage,
 		}
 	}()
@@ -403,6 +434,7 @@ func buildClaudeArgs(opts ExecOptions, logger *slog.Logger) []string {
 	if opts.ResumeSessionID != "" {
 		args = append(args, "--resume", opts.ResumeSessionID)
 	}
+	args = append(args, filterCustomArgs(opts.ExtraArgs, claudeBlockedArgs, logger)...)
 	args = append(args, filterCustomArgs(opts.CustomArgs, claudeBlockedArgs, logger)...)
 	return args
 }
@@ -436,6 +468,20 @@ func buildClaudeInput(prompt string) ([]byte, error) {
 		return nil, fmt.Errorf("marshal claude input: %w", err)
 	}
 	return append(data, '\n'), nil
+}
+
+// resolveSessionID decides which session id to report on the Result. When the
+// caller requested --resume but claude emitted a fresh, different session id
+// AND the run failed, the resume did not land (claude prints
+// "No conversation found with session ID: ..." to stderr, generates a fresh
+// session, and exits). Returning "" in that case keeps the daemon's
+// retry-with-fresh-session fallback able to trigger, instead of silently
+// persisting a brand-new id as if resume had succeeded.
+func resolveSessionID(requestedResume, emitted string, failed bool) string {
+	if failed && requestedResume != "" && emitted != "" && emitted != requestedResume {
+		return ""
+	}
+	return emitted
 }
 
 func buildEnv(extra map[string]string) []string {
@@ -530,6 +576,7 @@ func writeMcpConfigToTemp(raw json.RawMessage) (string, error) {
 
 func detectCLIVersion(ctx context.Context, execPath string) (string, error) {
 	cmd := exec.CommandContext(ctx, execPath, "--version")
+	hideAgentWindow(cmd)
 	data, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("detect version for %s: %w", execPath, err)

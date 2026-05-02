@@ -13,7 +13,39 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/multica-ai/multica/server/internal/cli"
+	"github.com/multica-ai/multica/server/internal/util"
 )
+
+// resolveTextFlag picks between a `--<name>` flag value and a paired
+// `--<name>-stdin` flag, mirroring the existing `--content` / `--content-stdin`
+// pattern. It returns the resolved string and an error when both are set or
+// stdin is requested but produces no body. Inline flag values are passed
+// through util.UnescapeBackslashEscapes so bash-double-quoted `\n` becomes a
+// real newline; stdin bodies are returned verbatim so literal backslashes
+// survive intact.
+func resolveTextFlag(cmd *cobra.Command, flagName string) (string, bool, error) {
+	stdinFlag := flagName + "-stdin"
+	useStdin, _ := cmd.Flags().GetBool(stdinFlag)
+	inline, _ := cmd.Flags().GetString(flagName)
+	if useStdin && inline != "" {
+		return "", false, fmt.Errorf("--%s and --%s are mutually exclusive", flagName, stdinFlag)
+	}
+	if useStdin {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", false, fmt.Errorf("read stdin for --%s: %w", stdinFlag, err)
+		}
+		body := strings.TrimSuffix(string(data), "\n")
+		if body == "" {
+			return "", false, fmt.Errorf("stdin content for --%s is empty", stdinFlag)
+		}
+		return body, true, nil
+	}
+	if inline == "" {
+		return "", false, nil
+	}
+	return util.UnescapeBackslashEscapes(inline), true, nil
+}
 
 var issueCmd = &cobra.Command{
 	Use:   "issue",
@@ -132,6 +164,13 @@ var issueRunMessagesCmd = &cobra.Command{
 	RunE:  runIssueRunMessages,
 }
 
+var issueRerunCmd = &cobra.Command{
+	Use:   "rerun <id>",
+	Short: "Re-enqueue an issue's current agent assignment as a fresh task",
+	Args:  exactArgs(1),
+	RunE:  runIssueRerun,
+}
+
 var issueSearchCmd = &cobra.Command{
 	Use:   "search <query>",
 	Short: "Search issues by title or description",
@@ -154,6 +193,7 @@ func init() {
 	issueCmd.AddCommand(issueSubscriberCmd)
 	issueCmd.AddCommand(issueRunsCmd)
 	issueCmd.AddCommand(issueRunMessagesCmd)
+	issueCmd.AddCommand(issueRerunCmd)
 	issueCmd.AddCommand(issueSearchCmd)
 
 	issueCommentCmd.AddCommand(issueCommentListCmd)
@@ -178,7 +218,8 @@ func init() {
 
 	// issue create
 	issueCreateCmd.Flags().String("title", "", "Issue title (required)")
-	issueCreateCmd.Flags().String("description", "", "Issue description")
+	issueCreateCmd.Flags().String("description", "", "Issue description (decodes \\n, \\r, \\t, \\\\; pipe via --description-stdin to preserve literal backslashes)")
+	issueCreateCmd.Flags().Bool("description-stdin", false, "Read issue description from stdin (preserves multi-line content verbatim)")
 	issueCreateCmd.Flags().String("status", "", "Issue status")
 	issueCreateCmd.Flags().String("priority", "", "Issue priority")
 	issueCreateCmd.Flags().String("assignee", "", "Assignee name (member or agent)")
@@ -190,7 +231,8 @@ func init() {
 
 	// issue update
 	issueUpdateCmd.Flags().String("title", "", "New title")
-	issueUpdateCmd.Flags().String("description", "", "New description")
+	issueUpdateCmd.Flags().String("description", "", "New description (decodes \\n, \\r, \\t, \\\\; pipe via --description-stdin to preserve literal backslashes)")
+	issueUpdateCmd.Flags().Bool("description-stdin", false, "Read new description from stdin (preserves multi-line content verbatim)")
 	issueUpdateCmd.Flags().String("status", "", "New status")
 	issueUpdateCmd.Flags().String("priority", "", "New priority")
 	issueUpdateCmd.Flags().String("assignee", "", "New assignee name (member or agent)")
@@ -216,13 +258,16 @@ func init() {
 	// issue runs
 	issueRunsCmd.Flags().String("output", "table", "Output format: table or json")
 
+	// issue rerun
+	issueRerunCmd.Flags().String("output", "json", "Output format: table or json")
+
 	// issue run-messages
 	issueRunMessagesCmd.Flags().String("output", "json", "Output format: table or json")
 	issueRunMessagesCmd.Flags().Int("since", 0, "Only return messages after this sequence number")
 
 	// issue comment add
-	issueCommentAddCmd.Flags().String("content", "", "Comment content (required unless --content-stdin)")
-	issueCommentAddCmd.Flags().Bool("content-stdin", false, "Read comment content from stdin (avoids shell escaping issues)")
+	issueCommentAddCmd.Flags().String("content", "", "Comment content (decodes \\n, \\r, \\t, \\\\; pipe via --content-stdin for multi-line bodies or to preserve literal backslashes)")
+	issueCommentAddCmd.Flags().Bool("content-stdin", false, "Read comment content from stdin (preserves multi-line content verbatim)")
 	issueCommentAddCmd.Flags().String("parent", "", "Parent comment ID (reply to a specific comment)")
 	issueCommentAddCmd.Flags().StringSlice("attachment", nil, "File path(s) to attach (can be specified multiple times)")
 	issueCommentAddCmd.Flags().String("output", "json", "Output format: table or json")
@@ -379,6 +424,15 @@ func runIssueGet(cmd *cobra.Command, args []string) error {
 	return cli.PrintJSON(os.Stdout, issue)
 }
 
+// isHTTPURL reports whether path is an http:// or https:// URL.
+// Used to skip URL-shaped values passed to --attachment, which only
+// accepts local file paths. Trims surrounding whitespace because
+// agent-generated commands sometimes copy URLs with stray spaces.
+func isHTTPURL(path string) bool {
+	p := strings.TrimSpace(path)
+	return strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://")
+}
+
 func runIssueCreate(cmd *cobra.Command, _ []string) error {
 	title, _ := cmd.Flags().GetString("title")
 	if title == "" {
@@ -400,8 +454,12 @@ func runIssueCreate(cmd *cobra.Command, _ []string) error {
 	defer cancel()
 
 	body := map[string]any{"title": title}
-	if v, _ := cmd.Flags().GetString("description"); v != "" {
-		body["description"] = v
+	desc, hasDesc, err := resolveTextFlag(cmd, "description")
+	if err != nil {
+		return err
+	}
+	if hasDesc {
+		body["description"] = desc
 	}
 	if v, _ := cmd.Flags().GetString("status"); v != "" {
 		body["status"] = v
@@ -427,22 +485,65 @@ func runIssueCreate(cmd *cobra.Command, _ []string) error {
 		body["assignee_id"] = aID
 	}
 
+	// Quick-create stamp: when the daemon sets MULTICA_QUICK_CREATE_TASK_ID
+	// before invoking the agent, the agent's `multica issue create` call
+	// inherits the env var and tags the new issue with origin_type=
+	// quick_create + origin_id=<task_id>. The completion handler then
+	// locates the issue deterministically by origin instead of "most
+	// recent issue by this agent", which is racy when max_concurrent_tasks
+	// > 1 and the agent is creating other issues in parallel.
+	if taskID := os.Getenv("MULTICA_QUICK_CREATE_TASK_ID"); taskID != "" {
+		body["origin_type"] = "quick_create"
+		body["origin_id"] = taskID
+	}
+
+	// Pre-validate attachments BEFORE creating the issue so a bad path
+	// can never produce a half-created issue (which would otherwise
+	// trigger callers — especially the agent doing quick-create — to
+	// retry the whole `issue create` and end up with duplicates).
+	//
+	//   - http(s) URLs are not local files; the API only accepts local
+	//     paths here. Warn and skip rather than fail — a markdown image
+	//     URL embedded in the prompt should never be re-attached, and
+	//     skipping is the safest outcome for that case.
+	//   - Anything else is treated as a local path and read upfront.
+	//     A read failure here is a real user/agent mistake (typo,
+	//     missing file) and we surface it pre-create so the issue
+	//     never lands.
+	type pendingAttachment struct {
+		path string
+		data []byte
+	}
+	pending := make([]pendingAttachment, 0, len(attachments))
+	for _, filePath := range attachments {
+		if isHTTPURL(filePath) {
+			fmt.Fprintf(os.Stderr, "Skipping --attachment %q: URLs are not supported here, only local file paths.\n", filePath)
+			continue
+		}
+		data, readErr := os.ReadFile(filePath)
+		if readErr != nil {
+			return fmt.Errorf("read attachment %s: %w", filePath, readErr)
+		}
+		pending = append(pending, pendingAttachment{path: filePath, data: data})
+	}
+
 	var result map[string]any
 	if err := client.PostJSON(ctx, "/api/issues", body, &result); err != nil {
 		return fmt.Errorf("create issue: %w", err)
 	}
 
 	// Upload attachments and link them to the newly created issue.
+	// Failures here are partial-success: the issue exists already, so
+	// turning a non-zero exit on the caller would invite a retry that
+	// duplicates the issue. Warn on stderr and continue.
 	issueID := strVal(result, "id")
-	for _, filePath := range attachments {
-		data, readErr := os.ReadFile(filePath)
-		if readErr != nil {
-			return fmt.Errorf("read attachment %s: %w", filePath, readErr)
+	for _, att := range pending {
+		if _, uploadErr := client.UploadFile(ctx, att.data, att.path, issueID); uploadErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: upload attachment %s failed (issue already created, %s): %v\n",
+				att.path, strVal(result, "identifier"), uploadErr)
+			continue
 		}
-		if _, uploadErr := client.UploadFile(ctx, data, filePath, issueID); uploadErr != nil {
-			return fmt.Errorf("upload attachment %s: %w", filePath, uploadErr)
-		}
-		fmt.Fprintf(os.Stderr, "Uploaded %s\n", filePath)
+		fmt.Fprintf(os.Stderr, "Uploaded %s\n", att.path)
 	}
 
 	output, _ := cmd.Flags().GetString("output")
@@ -475,9 +576,12 @@ func runIssueUpdate(cmd *cobra.Command, args []string) error {
 		v, _ := cmd.Flags().GetString("title")
 		body["title"] = v
 	}
-	if cmd.Flags().Changed("description") {
-		v, _ := cmd.Flags().GetString("description")
-		body["description"] = v
+	if cmd.Flags().Changed("description") || cmd.Flags().Changed("description-stdin") {
+		desc, _, err := resolveTextFlag(cmd, "description")
+		if err != nil {
+			return err
+		}
+		body["description"] = desc
 	}
 	if cmd.Flags().Changed("status") {
 		v, _ := cmd.Flags().GetString("status")
@@ -706,25 +810,11 @@ func runIssueCommentList(cmd *cobra.Command, args []string) error {
 }
 
 func runIssueCommentAdd(cmd *cobra.Command, args []string) error {
-	content, _ := cmd.Flags().GetString("content")
-	useStdin, _ := cmd.Flags().GetBool("content-stdin")
-
-	if content != "" && useStdin {
-		return fmt.Errorf("--content and --content-stdin are mutually exclusive")
+	content, hasContent, err := resolveTextFlag(cmd, "content")
+	if err != nil {
+		return err
 	}
-
-	if useStdin {
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return fmt.Errorf("read stdin: %w", err)
-		}
-		content = strings.TrimSuffix(string(data), "\n")
-		if content == "" {
-			return fmt.Errorf("stdin content is empty")
-		}
-	}
-
-	if content == "" {
+	if !hasContent {
 		return fmt.Errorf("--content or --content-stdin is required")
 	}
 
@@ -744,9 +834,18 @@ func runIssueCommentAdd(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// Upload attachments and collect their IDs.
+	// Upload attachments and collect their IDs. URLs are skipped with a
+	// warning — `--attachment` only accepts local file paths, and a
+	// markdown image URL embedded in agent-supplied content should never
+	// be re-uploaded as if it were a file. Unlike `issue create`, this
+	// path uploads BEFORE posting the comment, so a hard failure on a
+	// real (local) attachment correctly aborts the whole call.
 	var attachmentIDs []string
 	for _, filePath := range attachments {
+		if isHTTPURL(filePath) {
+			fmt.Fprintf(os.Stderr, "Skipping --attachment %q: URLs are not supported here, only local file paths.\n", filePath)
+			continue
+		}
 		data, readErr := os.ReadFile(filePath)
 		if readErr != nil {
 			return fmt.Errorf("read attachment %s: %w", filePath, readErr)
@@ -902,6 +1001,28 @@ func runIssueRunMessages(cmd *cobra.Command, args []string) error {
 // ---------------------------------------------------------------------------
 // Search command
 // ---------------------------------------------------------------------------
+
+func runIssueRerun(cmd *cobra.Command, args []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var task map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+args[0]+"/rerun", map[string]any{}, &task); err != nil {
+		return fmt.Errorf("rerun issue: %w", err)
+	}
+
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, task)
+	}
+	fmt.Fprintf(os.Stdout, "Re-enqueued task %s on agent %s\n", strVal(task, "id"), strVal(task, "agent_id"))
+	return nil
+}
 
 func runIssueSearch(cmd *cobra.Command, args []string) error {
 	client, err := newAPIClient(cmd)
@@ -1071,9 +1192,35 @@ func resolveAssignee(ctx context.Context, client *cli.APIClient, name string) (s
 		return "", "", fmt.Errorf("workspace ID is required to resolve assignees; use --workspace-id or set MULTICA_WORKSPACE_ID")
 	}
 
-	nameLower := strings.ToLower(name)
-	var matches []assigneeMatch
+	input := strings.TrimSpace(name)
+	if input == "" {
+		return "", "", fmt.Errorf("no member or agent found matching %q", name)
+	}
+	inputLower := strings.ToLower(input)
+
+	// Matches are collected into three priority buckets. Higher-priority buckets
+	// short-circuit lower-priority matching so that, e.g., an exact name match
+	// always wins over a substring collision with another candidate.
+	//   1. idMatches        — full UUID or 8-char ShortID (as shown by `truncateID`).
+	//   2. exactMatches     — case-insensitive full name equality.
+	//   3. substringMatches — preserves the existing partial-name UX.
+	var idMatches, exactMatches, substringMatches []assigneeMatch
 	var errs []error
+
+	classify := func(entityType, id, displayName string) {
+		match := assigneeMatch{Type: entityType, ID: id, Name: displayName}
+		if id != "" && (strings.EqualFold(id, input) || strings.EqualFold(truncateID(id), input)) {
+			idMatches = append(idMatches, match)
+			return
+		}
+		if strings.EqualFold(displayName, input) {
+			exactMatches = append(exactMatches, match)
+			return
+		}
+		if strings.Contains(strings.ToLower(displayName), inputLower) {
+			substringMatches = append(substringMatches, match)
+		}
+	}
 
 	// Search members.
 	var members []map[string]any
@@ -1081,14 +1228,7 @@ func resolveAssignee(ctx context.Context, client *cli.APIClient, name string) (s
 		errs = append(errs, fmt.Errorf("fetch members: %w", err))
 	} else {
 		for _, m := range members {
-			mName := strVal(m, "name")
-			if strings.Contains(strings.ToLower(mName), nameLower) {
-				matches = append(matches, assigneeMatch{
-					Type: "member",
-					ID:   strVal(m, "user_id"),
-					Name: mName,
-				})
-			}
+			classify("member", strVal(m, "user_id"), strVal(m, "name"))
 		}
 	}
 
@@ -1099,14 +1239,7 @@ func resolveAssignee(ctx context.Context, client *cli.APIClient, name string) (s
 		errs = append(errs, fmt.Errorf("fetch agents: %w", err))
 	} else {
 		for _, a := range agents {
-			aName := strVal(a, "name")
-			if strings.Contains(strings.ToLower(aName), nameLower) {
-				matches = append(matches, assigneeMatch{
-					Type: "agent",
-					ID:   strVal(a, "id"),
-					Name: aName,
-				})
-			}
+			classify("agent", strVal(a, "id"), strVal(a, "name"))
 		}
 	}
 
@@ -1115,18 +1248,25 @@ func resolveAssignee(ctx context.Context, client *cli.APIClient, name string) (s
 		return "", "", fmt.Errorf("failed to resolve assignee: %v; %v", errs[0], errs[1])
 	}
 
-	switch len(matches) {
-	case 0:
-		return "", "", fmt.Errorf("no member or agent found matching %q", name)
-	case 1:
-		return matches[0].Type, matches[0].ID, nil
-	default:
-		var parts []string
-		for _, m := range matches {
-			parts = append(parts, fmt.Sprintf("  %s %q (%s)", m.Type, m.Name, truncateID(m.ID)))
+	for _, bucket := range [][]assigneeMatch{idMatches, exactMatches, substringMatches} {
+		switch len(bucket) {
+		case 0:
+			continue
+		case 1:
+			return bucket[0].Type, bucket[0].ID, nil
+		default:
+			return "", "", ambiguousAssigneeError(input, bucket)
 		}
-		return "", "", fmt.Errorf("ambiguous assignee %q; matches:\n%s", name, strings.Join(parts, "\n"))
 	}
+	return "", "", fmt.Errorf("no member or agent found matching %q", input)
+}
+
+func ambiguousAssigneeError(input string, matches []assigneeMatch) error {
+	parts := make([]string, 0, len(matches))
+	for _, m := range matches {
+		parts = append(parts, fmt.Sprintf("  %s %q (%s)", m.Type, m.Name, truncateID(m.ID)))
+	}
+	return fmt.Errorf("ambiguous assignee %q; matches:\n%s", input, strings.Join(parts, "\n"))
 }
 
 func formatAssignee(issue map[string]any) string {

@@ -5,10 +5,12 @@ package repocache
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,21 +20,45 @@ import (
 // It passes the full daemon environment so credential helpers (e.g. gh) can
 // locate their config, and disables TTY prompting so auth failures produce
 // clear errors instead of blocking on a non-existent terminal.
+//
+// safe.directory=* is set via GIT_CONFIG_* env vars so git trusts all
+// directories regardless of ownership. The daemon manages its own bare
+// caches and worktrees, so the ownership check adds no security value
+// and breaks CI environments where the runner UID differs from the
+// directory owner.
 func gitEnv() []string {
-	return append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	base := os.Environ()
+
+	// Find the existing GIT_CONFIG_COUNT so we append at the next index
+	// rather than overwriting any env-scoped git config (auth, URL
+	// rewrites, extra headers, etc.).
+	existing := 0
+	for _, e := range base {
+		if strings.HasPrefix(e, "GIT_CONFIG_COUNT=") {
+			if n, err := strconv.Atoi(strings.TrimPrefix(e, "GIT_CONFIG_COUNT=")); err == nil {
+				existing = n
+			}
+		}
+	}
+
+	idx := strconv.Itoa(existing)
+	return append(base,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_COUNT="+strconv.Itoa(existing+1),
+		"GIT_CONFIG_KEY_"+idx+"=safe.directory",
+		"GIT_CONFIG_VALUE_"+idx+"=*",
+	)
 }
 
 // RepoInfo describes a repository to cache.
 type RepoInfo struct {
-	URL         string
-	Description string
+	URL string
 }
 
 // CachedRepo describes a cached bare clone ready for worktree creation.
 type CachedRepo struct {
-	URL         string // remote URL
-	Description string // human-readable description
-	LocalPath   string // absolute path to the bare clone
+	URL       string // remote URL
+	LocalPath string // absolute path to the bare clone
 }
 
 // Cache manages bare git clones for workspace repositories.
@@ -125,28 +151,77 @@ func (c *Cache) Fetch(barePath string) error {
 	return gitFetch(barePath)
 }
 
-// bareDirName derives a directory name from a repo URL.
-// e.g. "https://github.com/org/my-repo.git" → "my-repo.git"
-func bareDirName(url string) string {
-	url = strings.TrimRight(url, "/")
-	name := url
-	if i := strings.LastIndex(url, "/"); i >= 0 {
-		name = url[i+1:]
+// bareDirName returns a filesystem-safe, collision-free directory name for
+// the bare clone of rawURL. The name is built from the host plus each
+// path segment, joined by '+'. '+' is disallowed in GitHub and GitLab
+// path segments, so two URLs produce the same name only if they point at
+// the same repository on the same host.
+//
+// Examples:
+//
+//	https://github.com/org/my-repo.git           -> github.com+org+my-repo.git
+//	git@github.com:org/my-repo                   -> github.com+org+my-repo.git
+//	git@github.com:foo/bar-baz.git               -> github.com+foo+bar-baz.git
+//	git@github.com:foo-bar/baz.git               -> github.com+foo-bar+baz.git
+//	git@github.com:org/repo.git                  -> github.com+org+repo.git
+//	git@gitlab.example.com:org/repo.git          -> gitlab.example.com+org+repo.git
+//	ssh://git@gitlab.example.com:22/g/s/r.git    -> gitlab.example.com%3A22+g+s+r.git
+//	git@gitlab.example.com-22:org/repo.git       -> gitlab.example.com-22+org+repo.git
+//	my-repo                                      -> my-repo.git (bare name fallback)
+func bareDirName(rawURL string) string {
+	rawURL = strings.TrimRight(rawURL, "/")
+
+	host, path := splitHostAndPath(rawURL)
+	host = strings.ToLower(strings.TrimSpace(host))
+	// Encode ':' as '%3A' so host:port is lossless. A naive ':'->'-' rewrite
+	// would collapse `gitlab.example.com:22` onto a literal hostname
+	// `gitlab.example.com-22`, reintroducing the silent wrong-remote class
+	// this function exists to prevent. '%' is forbidden in valid hostnames
+	// (RFC 952 / RFC 1123), and in GitHub/GitLab path segments, so the
+	// encoded marker can never come from a legal input.
+	host = strings.ReplaceAll(host, ":", "%3A")
+
+	var parts []string
+	if host != "" {
+		parts = append(parts, host)
 	}
-	// Handle SSH-style "host:org/repo".
-	if i := strings.LastIndex(name, ":"); i >= 0 {
-		name = name[i+1:]
-		if j := strings.LastIndex(name, "/"); j >= 0 {
-			name = name[j+1:]
+	for _, seg := range strings.Split(path, "/") {
+		if seg != "" {
+			parts = append(parts, seg)
 		}
 	}
+
+	name := strings.Join(parts, "+")
 	if !strings.HasSuffix(name, ".git") {
 		name += ".git"
 	}
-	if name == ".git" {
+	if name == "" || name == ".git" {
 		name = "repo.git"
 	}
 	return name
+}
+
+// splitHostAndPath extracts the host and path-with-namespace from the
+// supported git URL forms:
+//
+//   - URL form (ssh://user@host[:port]/path, https://host/path) — returns
+//     u.Host verbatim (may include :port) and u.Path without the leading slash.
+//   - scp-style ([user@]host:path) — splits on the first ':' after the
+//     optional 'user@'.
+//   - Anything else (bare repo names, absolute filesystem paths) — returns
+//     an empty host and the raw input as the path.
+func splitHostAndPath(rawURL string) (host, path string) {
+	if u, err := url.Parse(rawURL); err == nil && u.Scheme != "" && u.Host != "" {
+		return u.Host, strings.TrimPrefix(u.Path, "/")
+	}
+	s := rawURL
+	if i := strings.Index(s, "@"); i >= 0 {
+		s = s[i+1:]
+	}
+	if i := strings.Index(s, ":"); i >= 0 {
+		return s[:i], s[i+1:]
+	}
+	return "", s
 }
 
 // isBareRepo checks if a path looks like a bare git repository.
@@ -277,11 +352,12 @@ func setFetchRefspec(barePath, refspec string) error {
 
 // WorktreeParams holds inputs for creating a worktree from a cached bare clone.
 type WorktreeParams struct {
-	WorkspaceID string // workspace that owns the repo
-	RepoURL     string // remote URL to look up in the cache
-	WorkDir     string // parent directory for the worktree (e.g. task workdir)
-	AgentName   string // for branch naming
-	TaskID      string // for branch naming uniqueness
+	WorkspaceID        string // workspace that owns the repo
+	RepoURL            string // remote URL to look up in the cache
+	WorkDir            string // parent directory for the worktree (e.g. task workdir)
+	AgentName          string // for branch naming
+	TaskID             string // for branch naming uniqueness
+	CoAuthoredByEnabled bool  // install prepare-commit-msg hook for Co-authored-by trailer
 }
 
 // WorktreeResult describes a successfully created worktree.
@@ -351,6 +427,13 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 			_ = excludeFromGit(worktreePath, pattern)
 		}
 
+		// Install Co-authored-by hook for Multica Agent attribution (if enabled).
+		if params.CoAuthoredByEnabled {
+			if err := installCoAuthoredByHook(worktreePath); err != nil {
+				c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
+			}
+		}
+
 		c.logger.Info("repo checkout: existing worktree updated",
 			"url", params.RepoURL,
 			"path", worktreePath,
@@ -374,6 +457,13 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	// Exclude agent context files from git tracking.
 	for _, pattern := range []string{".agent_context", "CLAUDE.md", "AGENTS.md", ".claude", ".config/opencode"} {
 		_ = excludeFromGit(worktreePath, pattern)
+	}
+
+	// Install Co-authored-by hook for Multica Agent attribution (if enabled).
+	if params.CoAuthoredByEnabled {
+		if err := installCoAuthoredByHook(worktreePath); err != nil {
+			c.logger.Warn("repo checkout: install co-authored-by hook failed (non-fatal)", "error", err)
+		}
 	}
 
 	c.logger.Info("repo checkout: worktree created",
@@ -598,6 +688,58 @@ func bareHeadBranch(barePath string) string {
 		return ""
 	}
 	return ref
+}
+
+// prepareCommitMsgHook is the prepare-commit-msg hook script that appends a
+// Co-authored-by trailer for the Multica Agent to every commit message.
+const prepareCommitMsgHook = `#!/bin/sh
+# Multica: add Co-authored-by trailer for the Multica Agent.
+# Installed by the Multica daemon. Do not edit — it will be overwritten.
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="$2"
+
+# Skip merge and squash commits.
+case "$COMMIT_SOURCE" in
+  merge|squash) exit 0 ;;
+esac
+
+TRAILER="Co-authored-by: multica-agent <github@multica.ai>"
+
+# Don't add if already present.
+if grep -qF "$TRAILER" "$COMMIT_MSG_FILE"; then
+  exit 0
+fi
+
+# Use git interpret-trailers for proper formatting.
+git interpret-trailers --in-place --trailer "$TRAILER" "$COMMIT_MSG_FILE"
+`
+
+// installCoAuthoredByHook installs a prepare-commit-msg git hook that appends
+// a Co-authored-by trailer for the Multica Agent. The hook is installed in the
+// git common directory (the bare repo for worktrees) so it applies to all
+// worktrees created from this cache.
+func installCoAuthoredByHook(worktreePath string) error {
+	cmd := exec.Command("git", "-C", worktreePath, "rev-parse", "--git-common-dir")
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("resolve git common dir: %w", err)
+	}
+	commonDir := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(worktreePath, commonDir)
+	}
+
+	hooksDir := filepath.Join(commonDir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		return fmt.Errorf("create hooks dir: %w", err)
+	}
+
+	hookPath := filepath.Join(hooksDir, "prepare-commit-msg")
+	if err := os.WriteFile(hookPath, []byte(prepareCommitMsgHook), 0o755); err != nil {
+		return fmt.Errorf("write prepare-commit-msg hook: %w", err)
+	}
+	return nil
 }
 
 // excludeFromGit adds a pattern to the worktree's .git/info/exclude file.

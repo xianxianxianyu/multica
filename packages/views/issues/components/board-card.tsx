@@ -14,12 +14,15 @@ import { useUpdateIssue } from "@multica/core/issues/mutations";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { projectListOptions } from "@multica/core/projects/queries";
+import { ProjectIcon } from "../../projects/components/project-icon";
 import { PriorityIcon } from "./priority-icon";
 import { PriorityPicker, AssigneePicker, DueDatePicker } from "./pickers";
 import { PRIORITY_CONFIG } from "@multica/core/issues/config";
 import { useViewStore } from "@multica/core/issues/stores/view-store-context";
 import { ProgressRing } from "./progress-ring";
 import type { ChildProgress } from "./list-row";
+import { IssueActionsContextMenu } from "../actions";
+import { LabelChip } from "../../labels/label-chip";
 
 function formatDate(date: string): string {
   return new Date(date).toLocaleDateString("en-US", {
@@ -58,6 +61,7 @@ export const BoardCardContent = memo(function BoardCardContent({
     enabled: storeProperties.project && !!issue.project_id,
   });
   const project = issue.project_id ? projects.find((p) => p.id === issue.project_id) : undefined;
+  const labels = issue.labels ?? [];
 
   const updateIssueMutation = useUpdateIssue();
   const handleUpdate = useCallback(
@@ -76,9 +80,10 @@ export const BoardCardContent = memo(function BoardCardContent({
   const showDueDate = storeProperties.dueDate && issue.due_date;
   const showProject = storeProperties.project && project;
   const showChildProgress = storeProperties.childProgress && childProgress;
+  const showLabels = storeProperties.labels && labels.length > 0;
 
   return (
-    <div className="rounded-lg border-[0.5px] bg-card py-3 px-2.5 shadow-[0_3px_6px_-2px_rgba(0,0,0,0.02),0_1px_1px_0_rgba(0,0,0,0.04)] transition-shadow group-hover:shadow-sm">
+    <div className="rounded-lg border-[0.5px] border-border bg-card py-3 px-2.5 shadow-[0_3px_6px_-2px_rgba(0,0,0,0.02),0_1px_1px_0_rgba(0,0,0,0.04)] transition-colors group-hover/card:border-accent group-hover/card:bg-accent group-data-[popup-open]/card:border-accent group-data-[popup-open]/card:bg-accent">
       {/* Row 1: Identifier */}
       <p className="text-xs text-muted-foreground">{issue.identifier}</p>
 
@@ -87,8 +92,8 @@ export const BoardCardContent = memo(function BoardCardContent({
         {issue.title}
       </p>
 
-      {/* Sub-issue progress + project */}
-      {(showChildProgress || showProject) && (
+      {/* Sub-issue progress + project + labels */}
+      {(showChildProgress || showProject || showLabels) && (
         <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
           {showChildProgress && (
             <div className="inline-flex items-center gap-1 rounded-full bg-muted/60 px-1.5 py-0.5">
@@ -100,10 +105,13 @@ export const BoardCardContent = memo(function BoardCardContent({
           )}
           {showProject && (
             <span className="inline-flex items-center gap-1 rounded-full bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground max-w-[160px]">
-              <span aria-hidden="true" className="shrink-0">{project!.icon || "📁"}</span>
+              <ProjectIcon project={project} size="sm" />
               <span className="truncate">{project!.title}</span>
             </span>
           )}
+          {showLabels && labels.map((label) => (
+            <LabelChip key={label.id} label={label} />
+          ))}
         </div>
       )}
 
@@ -129,6 +137,7 @@ export const BoardCardContent = memo(function BoardCardContent({
                       actorType={issue.assignee_type!}
                       actorId={issue.assignee_id!}
                       size={22}
+                      enableHoverCard
                     />
                   }
                 />
@@ -138,6 +147,7 @@ export const BoardCardContent = memo(function BoardCardContent({
                 actorType={issue.assignee_type!}
                 actorId={issue.assignee_id!}
                 size={22}
+                enableHoverCard
               />
             ))}
           {showPriority &&
@@ -228,19 +238,21 @@ export const DraggableBoardCard = memo(function DraggableBoardCard({ issue, chil
   };
 
   return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      {...attributes}
-      {...listeners}
-      className={isDragging ? "opacity-30" : ""}
-    >
-      <AppLink
-        href={p.issueDetail(issue.id)}
-        className={`group block transition-colors ${isDragging ? "pointer-events-none" : ""}`}
+    <IssueActionsContextMenu issue={issue}>
+      <div
+        ref={setNodeRef}
+        style={style}
+        {...attributes}
+        {...listeners}
+        className={`group/card ${isDragging ? "opacity-30" : ""}`}
       >
-        <BoardCardContent issue={issue} editable childProgress={childProgress} />
-      </AppLink>
-    </div>
+        <AppLink
+          href={p.issueDetail(issue.id)}
+          className={`group block transition-colors ${isDragging ? "pointer-events-none" : ""}`}
+        >
+          <BoardCardContent issue={issue} editable childProgress={childProgress} />
+        </AppLink>
+      </div>
+    </IssueActionsContextMenu>
   );
 });

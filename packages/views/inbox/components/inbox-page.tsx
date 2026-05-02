@@ -1,13 +1,16 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useDefaultLayout } from "react-resizable-panels";
 import { useQuery } from "@tanstack/react-query";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useWorkspacePaths } from "@multica/core/paths";
+import { useModalStore } from "@multica/core/modals";
+import { useIssueDraftStore } from "@multica/core/issues/stores/draft-store";
 import {
   inboxListOptions,
   deduplicateInboxItems,
+  useInboxUnreadCount,
 } from "@multica/core/inbox/queries";
 import {
   useMarkInboxRead,
@@ -17,6 +20,7 @@ import {
   useArchiveAllReadInbox,
   useArchiveCompletedInbox,
 } from "@multica/core/inbox/mutations";
+
 import { IssueDetail } from "../../issues/components";
 import { useNavigation } from "../../navigation";
 import { toast } from "sonner";
@@ -48,6 +52,7 @@ import { useIsMobile } from "@multica/ui/hooks/use-mobile";
 import { PageHeader } from "../../layout/page-header";
 import { InboxListItem, timeAgo } from "./inbox-list-item";
 import { typeLabels } from "./inbox-detail-label";
+import { getInboxDisplayTitle } from "./inbox-display";
 
 export function InboxPage() {
   const { searchParams, replace } = useNavigation();
@@ -67,15 +72,14 @@ export function InboxPage() {
 
   const selected = items.find((i) => (i.issue_id ?? i.id) === selectedKey) ?? null;
 
-  // Shared inbox links (?issue=<id>) may point to notifications not in this
-  // user's inbox (archived, or never received). Fall back to the issue page
-  // so the URL still resolves to something meaningful.
+  // Track the last key we actually resolved against the inbox list. Lets the
+  // fallback effect distinguish "shared-link to a notification not in our
+  // inbox" (never resolved → redirect to the issue page) from "item was in
+  // our inbox and just got removed" (was resolved → stay on /inbox).
+  const lastResolvedKeyRef = useRef<string>("");
   useEffect(() => {
-    if (loading) return;
-    if (!selectedKey) return;
-    if (selected) return;
-    replace(wsPaths.issueDetail(selectedKey));
-  }, [loading, selectedKey, selected, replace, wsPaths]);
+    if (selected) lastResolvedKeyRef.current = selectedKey;
+  }, [selected, selectedKey]);
 
   const setSelectedKey = useCallback((key: string) => {
     setSelectedKeyState(key);
@@ -84,12 +88,29 @@ export function InboxPage() {
     replace(url);
   }, [replace, wsPaths]);
 
+  // Shared inbox links (?issue=<id>) may point to notifications not in this
+  // user's inbox (archived, or never received). Fall back to the issue page
+  // so the URL still resolves to something meaningful. But if the key was
+  // previously resolvable (e.g. the issue was just deleted in another tab
+  // and `onInboxIssueDeleted` pruned the cache), the issue detail would 404
+  // too — clear the selection and stay on /inbox instead.
+  useEffect(() => {
+    if (loading) return;
+    if (!selectedKey) return;
+    if (selected) return;
+    if (lastResolvedKeyRef.current === selectedKey) {
+      setSelectedKey("");
+      return;
+    }
+    replace(wsPaths.issueDetail(selectedKey));
+  }, [loading, selectedKey, selected, replace, wsPaths, setSelectedKey]);
+
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
     id: "multica_inbox_layout",
   });
 
   const isMobile = useIsMobile();
-  const unreadCount = items.filter((i) => !i.read).length;
+  const unreadCount = useInboxUnreadCount(wsId);
 
   const markReadMutation = useMarkInboxRead();
   const archiveMutation = useArchiveInbox();
@@ -97,15 +118,23 @@ export function InboxPage() {
   const archiveAllMutation = useArchiveAllInbox();
   const archiveAllReadMutation = useArchiveAllReadInbox();
   const archiveCompletedMutation = useArchiveCompletedInbox();
+  // Auto-mark-read whenever a selected item is unread — covers both click-
+  // to-select and URL-param-select (e.g. OS notification click on desktop).
+  // The mutation flips `read: true` optimistically, so this effect settles
+  // in one pass and can't loop. Kept in a `useEffect` rather than inlined
+  // in handleSelect so URL-driven selection triggers it too.
+  const markReadMutate = markReadMutation.mutate;
+  const selectedId = selected?.id;
+  const selectedRead = selected?.read;
+  useEffect(() => {
+    if (!selectedId || selectedRead) return;
+    markReadMutate(selectedId, {
+      onError: () => toast.error("Failed to mark as read"),
+    });
+  }, [selectedId, selectedRead, markReadMutate]);
 
-  // Click-to-read: select + auto-mark-read
   const handleSelect = (item: InboxItem) => {
     setSelectedKey(item.issue_id ?? item.id);
-    if (!item.read) {
-      markReadMutation.mutate(item.id, {
-        onError: () => toast.error("Failed to mark as read"),
-      });
-    }
   };
 
   const handleArchive = (id: string) => {
@@ -212,19 +241,33 @@ export function InboxPage() {
   );
 
   const detailContent = selected?.issue_id ? (
+    // Key by issue_id (not inbox-item id): a new comment/reaction generates a
+    // new inbox notification for the same issue, and the dedup helper picks the
+    // newest one — keying on its id would remount IssueDetail on every event,
+    // wiping the comment composer draft and resetting scroll position.
     <IssueDetail
-      key={selected.id}
+      key={selected.issue_id}
       issueId={selected.issue_id}
       defaultSidebarOpen={false}
       layoutId="multica_inbox_issue_detail_layout"
       highlightCommentId={selected.details?.comment_id ?? undefined}
       onDelete={() => {
-        handleArchive(selected.id);
+        // Issue deletion CASCADE-deletes the inbox item server-side, and the
+        // issue:deleted WS event prunes it from the inbox cache. Just clear
+        // the selection — calling archive here would 404 on a row that no
+        // longer exists.
+        setSelectedKey("");
+      }}
+      onDone={() => {
+        setSelectedKey("");
+        archiveMutation.mutate(selected.id, {
+          onError: () => toast.error("Failed to archive"),
+        });
       }}
     />
   ) : selected ? (
     <div className="p-6">
-      <h2 className="text-lg font-semibold">{selected.title}</h2>
+      <h2 className="text-lg font-semibold">{getInboxDisplayTitle(selected)}</h2>
       <p className="mt-1 text-sm text-muted-foreground">
         {typeLabels[selected.type]} · {timeAgo(selected.created_at)}
       </p>
@@ -233,7 +276,35 @@ export function InboxPage() {
           {selected.body}
         </div>
       )}
-      <div className="mt-4">
+      {selected.type === "quick_create_failed" && selected.details?.original_prompt && (
+        <div className="mt-4 rounded-md border bg-muted/40 p-3">
+          <p className="text-xs font-medium text-muted-foreground">Original input</p>
+          <p className="mt-1 whitespace-pre-wrap text-sm">{selected.details.original_prompt}</p>
+        </div>
+      )}
+      <div className="mt-4 flex gap-2">
+        {selected.type === "quick_create_failed" && (
+          <Button
+            size="sm"
+            onClick={() => {
+              // Seed the legacy advanced form with the original prompt so the
+              // user can recover their input in the full editor instead of
+              // retyping. The agent picker hint becomes the assignee
+              // candidate (still editable).
+              const prompt = selected.details?.original_prompt ?? "";
+              const agentId = selected.details?.agent_id;
+              useIssueDraftStore.getState().setDraft({
+                description: prompt,
+                ...(agentId
+                  ? { assigneeType: "agent" as const, assigneeId: agentId }
+                  : {}),
+              });
+              useModalStore.getState().open("create-issue");
+            }}
+          >
+            Edit as advanced form
+          </Button>
+        )}
         <Button
           variant="outline"
           size="sm"

@@ -1,17 +1,20 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CoreProvider } from "@multica/core/platform";
 import { useAuthStore } from "@multica/core/auth";
 import { workspaceKeys, workspaceListOptions } from "@multica/core/workspace/queries";
 import { api } from "@multica/core/api";
+import { useHasOnboarded } from "@multica/core/paths";
 import { ThemeProvider } from "@multica/ui/components/common/theme-provider";
 import { MulticaIcon } from "@multica/ui/components/common/multica-icon";
-import { Toaster } from "sonner";
+import { Toaster } from "@multica/ui/components/ui/sonner";
 import { DesktopLoginPage } from "./pages/login";
 import { DesktopShell } from "./components/desktop-layout";
+import { PageviewTracker } from "./components/pageview-tracker";
 import { UpdateNotification } from "./components/update-notification";
 import { useTabStore } from "./stores/tab-store";
 import { useWindowOverlayStore } from "./stores/window-overlay-store";
+import { useDaemonIPCBridge } from "./platform/daemon-ipc-bridge";
 
 
 function AppContent() {
@@ -90,11 +93,75 @@ function AppContent() {
   // account switches (user A logout → user B login) should not trigger a
   // daemon restart here — daemon-manager already restarts on user change
   // via syncToken.
-  const { data: workspaces, isFetched: workspaceListFetched } = useQuery({
+  const { data: workspaces = [], isFetched: workspaceListFetched } = useQuery({
     ...workspaceListOptions(),
     enabled: !!user,
   });
-  const wsCount = workspaces?.length ?? 0;
+  const wsCount = workspaces.length;
+  const hasOnboarded = useHasOnboarded();
+
+  // Bridge local daemon IPC status into the runtimes cache so this user's
+  // own daemon flips to offline/online sub-second instead of waiting on the
+  // server's 75s sweeper. Resolves wsId from the active tab so workspace
+  // switches automatically rebind the subscription.
+  const activeWorkspaceSlug = useTabStore((s) => s.activeWorkspaceSlug);
+  const activeWsId = activeWorkspaceSlug
+    ? workspaces.find((w) => w.slug === activeWorkspaceSlug)?.id
+    : undefined;
+  useDaemonIPCBridge(activeWsId);
+
+  // Pre-workspace overlay routing for desktop. Mirrors the web entry-point
+  // judgment in callback / login:
+  //   un-onboarded:
+  //     pending invites on email → /invitations overlay
+  //     no invites               → /onboarding overlay
+  //   already onboarded:
+  //     zero workspaces          → /workspaces/new overlay
+  //     ≥1 workspaces            → no overlay, fall through to dashboard
+  //
+  // The "un-onboarded but in workspace" state is now physically impossible
+  // because backend transactions atomically set onboarded_at when a user
+  // joins the `member` table. Anyone with workspaces is by definition
+  // onboarded.
+  useEffect(() => {
+    if (!user || !workspaceListFetched) return undefined;
+    const { overlay, open } = useWindowOverlayStore.getState();
+    if (overlay) return undefined;
+    if (wsCount > 0) return undefined;
+    if (!hasOnboarded) {
+      // Look up pending invitations by email. Network blip is non-fatal —
+      // fall through to onboarding so the user isn't stuck on a blank
+      // window. The sidebar's pending-invitations dropdown will surface
+      // missed invites later once they're onboarded.
+      let cancelled = false;
+      void api
+        .listMyInvitations()
+        .then((invites) => {
+          if (cancelled) return;
+          const { overlay: latestOverlay, open: latestOpen } =
+            useWindowOverlayStore.getState();
+          if (latestOverlay) return;
+          if (invites.length > 0) {
+            qc.setQueryData(workspaceKeys.myInvitations(), invites);
+            latestOpen({ type: "invitations" });
+          } else {
+            latestOpen({ type: "onboarding" });
+          }
+        })
+        .catch(() => {
+          if (cancelled) return;
+          const { overlay: latestOverlay, open: latestOpen } =
+            useWindowOverlayStore.getState();
+          if (latestOverlay) return;
+          latestOpen({ type: "onboarding" });
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+    open({ type: "new-workspace" });
+    return undefined;
+  }, [user, workspaceListFetched, wsCount, workspaces, hasOnboarded, qc]);
 
   // Validate persisted tab state against the current user's workspace list,
   // and pick an active workspace if none is set. Runs in useLayoutEffect
@@ -104,32 +171,22 @@ function AppContent() {
   // warning because `switchWorkspace` is a Zustand setState that the
   // TabBar is subscribed to. useLayoutEffect flushes both renders before
   // the user sees anything, so there's no visible flicker.
+  //
+  // Gate on `workspaceListFetched`: useQuery defaults `data` to `[]` before
+  // the first fetch, so without this guard we'd run validation against an
+  // empty slug set, wipe the persisted `activeWorkspaceSlug`, then fall
+  // back to `workspaces[0]` once the real list arrives — losing the user's
+  // last-opened workspace on every app start.
   useLayoutEffect(() => {
-    if (!workspaces) return;
-    const validSlugs = new Set(workspaces.map((w) => w.slug));
-    const tabStore = useTabStore.getState();
-    tabStore.validateWorkspaceSlugs(validSlugs);
-    if (!tabStore.activeWorkspaceSlug && workspaces.length > 0) {
-      tabStore.switchWorkspace(workspaces[0].slug);
-    }
-  }, [workspaces]);
-
-  // Bidirectional new-workspace overlay: visible when there are no
-  // workspaces to enter, hidden as soon as one exists. Gated on
-  // `workspaceListFetched` so the initial render doesn't flash the
-  // overlay before the list arrives. The overlay's own `invite` type is
-  // not touched here — that's an in-flight task owned by the user.
-  useEffect(() => {
-    if (!user) return;
     if (!workspaceListFetched) return;
-    const { overlay, open, close } = useWindowOverlayStore.getState();
-    const isEmpty = wsCount === 0;
-    if (isEmpty) {
-      if (!overlay) open({ type: "new-workspace" });
-    } else if (overlay?.type === "new-workspace") {
-      close();
+    const validSlugs = new Set(workspaces.map((w) => w.slug));
+    useTabStore.getState().validateWorkspaceSlugs(validSlugs);
+    const { activeWorkspaceSlug, switchWorkspace } = useTabStore.getState();
+    if (!activeWorkspaceSlug && workspaces.length > 0) {
+      switchWorkspace(workspaces[0].slug);
     }
-  }, [user, workspaceListFetched, wsCount]);
+  }, [workspaces, workspaceListFetched]);
+
   // null = undecided (pre-login or list hasn't settled yet)
   // true  = session started with zero workspaces; next transition to >=1 triggers restart
   // false = session started with >=1 workspace, OR we've already restarted; skip
@@ -158,8 +215,15 @@ function AppContent() {
     );
   }
 
-  if (!user) return <DesktopLoginPage />;
-  return <DesktopShell />;
+  // Pageview tracker sits at the app root so it covers every visible
+  // surface (login, overlays, tab paths) — mounting it inside DesktopShell
+  // would miss the logged-out and overlay states.
+  return (
+    <>
+      <PageviewTracker />
+      {user ? <DesktopShell /> : <DesktopLoginPage />}
+    </>
+  );
 }
 
 // Backend the daemon should connect to — same URL the renderer talks to.
@@ -187,12 +251,20 @@ async function handleDaemonLogout() {
 }
 
 export default function App() {
+  const { version, os } = window.desktopAPI.appInfo;
+  // Stable identity reference so downstream effects (WS reconnect) don't
+  // tear down on every parent render.
+  const identity = useMemo(
+    () => ({ platform: "desktop", version, os }),
+    [version, os],
+  );
   return (
     <ThemeProvider>
       <CoreProvider
         apiBaseUrl={import.meta.env.VITE_API_URL || "http://localhost:8080"}
         wsUrl={import.meta.env.VITE_WS_URL || "ws://localhost:8080/ws"}
         onLogout={handleDaemonLogout}
+        identity={identity}
       >
         <AppContent />
       </CoreProvider>

@@ -12,7 +12,7 @@ import { projectDetailOptions } from "@multica/core/projects/queries";
 import { useUpdateProject, useDeleteProject } from "@multica/core/projects/mutations";
 import { pinListOptions } from "@multica/core/pins";
 import { useCreatePin, useDeletePin } from "@multica/core/pins";
-import { issueListOptions, childIssueProgressOptions } from "@multica/core/issues/queries";
+import { myIssueListOptions, childIssueProgressOptions, type MyIssuesFilter } from "@multica/core/issues/queries";
 import { useUpdateIssue } from "@multica/core/issues/mutations";
 import { memberListOptions, agentListOptions } from "@multica/core/workspace/queries";
 import { useWorkspaceId } from "@multica/core/hooks";
@@ -28,6 +28,7 @@ import { ActorAvatar } from "../../common/actor-avatar";
 import { AppLink, useNavigation } from "../../navigation";
 import { TitleEditor, ContentEditor, type ContentEditorRef } from "../../editor";
 import { PriorityIcon } from "../../issues/components/priority-icon";
+import { ProjectResourcesSection } from "./project-resources-section";
 import { IssuesHeader } from "../../issues/components/issues-header";
 import { BoardView } from "../../issues/components/board-view";
 import { ListView } from "../../issues/components/list-view";
@@ -94,7 +95,15 @@ function PropRow({
 
 const projectViewStore = createIssueViewStore("project_issues_view");
 
-function ProjectIssuesContent({ projectIssues }: { projectIssues: Issue[] }) {
+function ProjectIssuesContent({
+  projectIssues,
+  scope,
+  filter,
+}: {
+  projectIssues: Issue[];
+  scope: string;
+  filter: MyIssuesFilter;
+}) {
   const wsId = useWorkspaceId();
   const viewMode = useViewStore((s) => s.viewMode);
   const statusFilters = useViewStore((s) => s.statusFilters);
@@ -102,14 +111,11 @@ function ProjectIssuesContent({ projectIssues }: { projectIssues: Issue[] }) {
   const assigneeFilters = useViewStore((s) => s.assigneeFilters);
   const includeNoAssignee = useViewStore((s) => s.includeNoAssignee);
   const creatorFilters = useViewStore((s) => s.creatorFilters);
+  const labelFilters = useViewStore((s) => s.labelFilters);
 
   const issues = useMemo(
-    () => filterIssues(projectIssues, { statusFilters, priorityFilters, assigneeFilters, includeNoAssignee, creatorFilters, projectFilters: [], includeNoProject: false }),
-    [projectIssues, statusFilters, priorityFilters, assigneeFilters, includeNoAssignee, creatorFilters],
-  );
-  const doneColumnCount = useMemo(
-    () => projectIssues.filter((issue) => issue.status === "done").length,
-    [projectIssues],
+    () => filterIssues(projectIssues, { statusFilters, priorityFilters, assigneeFilters, includeNoAssignee, creatorFilters, projectFilters: [], includeNoProject: false, labelFilters }),
+    [projectIssues, statusFilters, priorityFilters, assigneeFilters, includeNoAssignee, creatorFilters, labelFilters],
   );
 
   const { data: childProgressMap = new Map() } = useQuery(childIssueProgressOptions(wsId));
@@ -128,11 +134,6 @@ function ProjectIssuesContent({ projectIssues }: { projectIssues: Issue[] }) {
   const updateIssueMutation = useUpdateIssue();
   const handleMoveIssue = useCallback(
     (issueId: string, newStatus: IssueStatus, newPosition?: number) => {
-      const viewState = projectViewStore.getState();
-      if (viewState.sortBy !== "position") {
-        viewState.setSortBy("position");
-        viewState.setSortDirection("asc");
-      }
       const updates: Partial<{ status: IssueStatus; position: number }> = { status: newStatus };
       if (newPosition !== undefined) updates.position = newPosition;
       updateIssueMutation.mutate(
@@ -158,19 +159,20 @@ function ProjectIssuesContent({ projectIssues }: { projectIssues: Issue[] }) {
       {viewMode === "board" ? (
         <BoardView
           issues={issues}
-          allIssues={projectIssues}
           visibleStatuses={visibleStatuses}
           hiddenStatuses={hiddenStatuses}
           onMoveIssue={handleMoveIssue}
           childProgressMap={childProgressMap}
-          doneTotal={doneColumnCount}
+          myIssuesScope={scope}
+          myIssuesFilter={filter}
         />
       ) : (
         <ListView
           issues={issues}
           visibleStatuses={visibleStatuses}
           childProgressMap={childProgressMap}
-          doneTotal={doneColumnCount}
+          myIssuesScope={scope}
+          myIssuesFilter={filter}
         />
       )}
     </div>
@@ -189,7 +191,14 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
   const workspace = useCurrentWorkspace();
   const workspaceName = workspace?.name;
   const { data: project, isLoading } = useQuery(projectDetailOptions(wsId, projectId));
-  const { data: allIssues = [] } = useQuery(issueListOptions(wsId));
+  const projectScope = `project:${projectId}`;
+  const projectFilter = useMemo<MyIssuesFilter>(
+    () => ({ project_id: projectId }),
+    [projectId],
+  );
+  const { data: projectIssues = [] } = useQuery(
+    myIssueListOptions(wsId, projectScope, projectFilter),
+  );
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: agents = [] } = useQuery(agentListOptions(wsId));
   const { getActorName } = useActorName();
@@ -231,11 +240,6 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
   const filteredMembers = members.filter((m) => m.name.toLowerCase().includes(leadQuery));
   const filteredAgents = agents.filter((a) => !a.archived_at && a.name.toLowerCase().includes(leadQuery));
 
-  const projectIssues = useMemo(
-    () => allIssues.filter((i) => i.project_id === projectId),
-    [allIssues, projectId],
-  );
-
   const handleUpdateField = useCallback(
     (data: Parameters<typeof updateProject.mutate>[0] extends { id: string } & infer R ? R : never) => {
       if (!project) return;
@@ -269,7 +273,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
     return <div className="flex items-center justify-center h-full text-muted-foreground">Project not found</div>;
   }
 
-  const issueMetrics = getProjectIssueMetrics(project, projectIssues);
+  const issueMetrics = getProjectIssueMetrics(project);
   const statusCfg = PROJECT_STATUS_CONFIG[project.status];
   const priorityCfg = PROJECT_PRIORITY_CONFIG[project.priority];
 
@@ -369,8 +373,8 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
                   <button type="button" className="inline-flex items-center gap-1.5 text-xs hover:text-foreground transition-colors">
                     {project.lead_type && project.lead_id ? (
                       <>
-                        <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size={16} />
-                        <span>{getActorName(project.lead_type, project.lead_id)}</span>
+                        <ActorAvatar actorType={project.lead_type} actorId={project.lead_id} size={16} enableHoverCard showStatusDot />
+                        <span className="cursor-pointer">{getActorName(project.lead_type, project.lead_id)}</span>
                       </>
                     ) : (
                       <span className="text-muted-foreground">No lead</span>
@@ -423,7 +427,7 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
                           onClick={() => { handleUpdateField({ lead_type: "agent", lead_id: a.id }); setLeadOpen(false); }}
                           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-accent transition-colors"
                         >
-                          <ActorAvatar actorType="agent" actorId={a.id} size={16} />
+                          <ActorAvatar actorType="agent" actorId={a.id} size={16} showStatusDot />
                           <span>{a.name}</span>
                         </button>
                       ))}
@@ -486,6 +490,9 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
           />
         </div>}
       </div>
+
+      {/* Resources */}
+      <ProjectResourcesSection projectId={projectId} />
     </div>
   );
 
@@ -573,7 +580,11 @@ export function ProjectDetail({ projectId }: { projectId: string }) {
 
           <ViewStoreProvider store={projectViewStore}>
               <IssuesHeader scopedIssues={projectIssues} />
-              <ProjectIssuesContent projectIssues={projectIssues} />
+              <ProjectIssuesContent
+                projectIssues={projectIssues}
+                scope={projectScope}
+                filter={projectFilter}
+              />
               <BatchActionToolbar />
             </ViewStoreProvider>
           </div>

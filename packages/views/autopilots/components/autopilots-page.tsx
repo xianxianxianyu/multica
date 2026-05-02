@@ -4,8 +4,6 @@ import { useState } from "react";
 import { Plus, Zap, Play, Pause, AlertCircle, Newspaper, GitPullRequest, Bug, BarChart3, Shield, FileSearch } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { autopilotListOptions } from "@multica/core/autopilots/queries";
-import { useCreateAutopilot, useCreateAutopilotTrigger } from "@multica/core/autopilots/mutations";
-import { agentListOptions } from "@multica/core/workspace/queries";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { useWorkspacePaths } from "@multica/core/paths";
 import { useActorName } from "@multica/core/workspace/hooks";
@@ -15,25 +13,7 @@ import { PageHeader } from "../../layout/page-header";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
 import { Button } from "@multica/ui/components/ui/button";
 import { cn } from "@multica/ui/lib/utils";
-import { toast } from "sonner";
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-} from "@multica/ui/components/ui/dialog";
-import {
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
-} from "@multica/ui/components/ui/select";
-import {
-  TriggerConfigSection,
-  getDefaultTriggerConfig,
-  toCronExpression,
-} from "./trigger-config";
-import type { TriggerConfig } from "./trigger-config";
+import { AutopilotDialog } from "./autopilot-dialog";
 import type { Autopilot } from "@multica/core/types";
 import type { TriggerFrequency } from "./trigger-config";
 
@@ -150,188 +130,41 @@ function AutopilotRow({ autopilot }: { autopilot: Autopilot }) {
   const StatusIcon = statusCfg.icon;
 
   return (
-    <div className="group/row flex h-11 items-center gap-2 px-5 text-sm transition-colors hover:bg-accent/40">
+    <div className="group/row flex flex-col gap-2 border-b px-4 py-3 text-sm transition-colors hover:bg-accent/40 sm:h-11 sm:flex-row sm:items-center sm:gap-2 sm:border-b-0 sm:px-5 sm:py-0">
       <AppLink
         href={wsPaths.autopilotDetail(autopilot.id)}
-        className="flex min-w-0 flex-1 items-center gap-2"
+        className="flex min-w-0 items-center gap-2 sm:flex-1"
       >
         <Zap className="h-4 w-4 shrink-0 text-muted-foreground" />
         <span className="min-w-0 flex-1 truncate font-medium">{autopilot.title}</span>
       </AppLink>
 
-      {/* Agent */}
-      <span className="flex w-32 items-center gap-1.5 shrink-0">
-        <ActorAvatar actorType="agent" actorId={autopilot.assignee_id} size={18} />
-        <span className="truncate text-xs text-muted-foreground">
-          {getActorName("agent", autopilot.assignee_id)}
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 pl-6 text-xs sm:contents sm:pl-0">
+        {/* Agent */}
+        <span className="flex min-w-0 items-center gap-1.5 text-muted-foreground sm:w-32 sm:shrink-0">
+          <ActorAvatar actorType="agent" actorId={autopilot.assignee_id} size={18} enableHoverCard showStatusDot />
+          <span className="truncate">
+            {getActorName("agent", autopilot.assignee_id)}
+          </span>
         </span>
-      </span>
 
-      {/* Mode */}
-      <span className="w-24 shrink-0 text-center text-xs text-muted-foreground">
-        {EXECUTION_MODE_LABELS[autopilot.execution_mode] ?? autopilot.execution_mode}
-      </span>
+        {/* Mode */}
+        <span className="text-muted-foreground sm:w-24 sm:shrink-0 sm:text-center">
+          {EXECUTION_MODE_LABELS[autopilot.execution_mode] ?? autopilot.execution_mode}
+        </span>
 
-      {/* Status */}
-      <span className={cn("flex w-20 items-center justify-center gap-1 shrink-0 text-xs", statusCfg.color)}>
-        <StatusIcon className="h-3 w-3" />
-        {statusCfg.label}
-      </span>
+        {/* Status */}
+        <span className={cn("flex items-center gap-1 sm:w-20 sm:shrink-0 sm:justify-center", statusCfg.color)}>
+          <StatusIcon className="h-3 w-3" />
+          {statusCfg.label}
+        </span>
 
-      {/* Last run */}
-      <span className="w-20 shrink-0 text-right text-xs text-muted-foreground tabular-nums">
-        {autopilot.last_run_at ? formatRelativeDate(autopilot.last_run_at) : "--"}
-      </span>
+        {/* Last run */}
+        <span className="text-muted-foreground tabular-nums sm:w-20 sm:shrink-0 sm:text-right">
+          {autopilot.last_run_at ? formatRelativeDate(autopilot.last_run_at) : "--"}
+        </span>
+      </div>
     </div>
-  );
-}
-
-function CreateAutopilotDialog({
-  open,
-  onOpenChange,
-  template,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  template?: AutopilotTemplate | null;
-}) {
-  const wsId = useWorkspaceId();
-  const { data: agents = [] } = useQuery(agentListOptions(wsId));
-  const createAutopilot = useCreateAutopilot();
-  const createTrigger = useCreateAutopilotTrigger();
-
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [assigneeId, setAssigneeId] = useState("");
-  const [triggerConfig, setTriggerConfig] = useState<TriggerConfig>(getDefaultTriggerConfig);
-  const [submitting, setSubmitting] = useState(false);
-
-  // Apply template when it changes
-  const [appliedTemplate, setAppliedTemplate] = useState<AutopilotTemplate | null | undefined>(null);
-  if (template !== appliedTemplate && open) {
-    setAppliedTemplate(template);
-    if (template) {
-      setTitle(template.title);
-      setDescription(template.prompt);
-      setTriggerConfig({
-        ...getDefaultTriggerConfig(),
-        frequency: template.frequency,
-        time: template.time,
-      });
-    }
-  }
-
-  const activeAgents = agents.filter((a) => !a.archived_at);
-
-  const handleSubmit = async () => {
-    if (!title.trim() || !assigneeId || submitting) return;
-    setSubmitting(true);
-    try {
-      const autopilot = await createAutopilot.mutateAsync({
-        title: title.trim(),
-        description: description.trim() || undefined,
-        assignee_id: assigneeId,
-        execution_mode: "create_issue",
-      });
-
-      // Attach schedule trigger
-      try {
-        await createTrigger.mutateAsync({
-          autopilotId: autopilot.id,
-          kind: "schedule",
-          cron_expression: toCronExpression(triggerConfig),
-          timezone: triggerConfig.timezone,
-        });
-      } catch {
-        toast.error("Autopilot created, but trigger failed to save");
-      }
-
-      onOpenChange(false);
-      setTitle("");
-      setDescription("");
-      setAssigneeId("");
-      setTriggerConfig(getDefaultTriggerConfig());
-      toast.success("Autopilot created");
-    } catch {
-      toast.error("Failed to create autopilot");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-lg">
-        <DialogTitle>New Autopilot</DialogTitle>
-        <div className="space-y-5 pt-2">
-          {/* Name */}
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">Name</label>
-            <input
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="e.g. Daily code review"
-              className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"
-              autoFocus
-            />
-          </div>
-
-          {/* Prompt */}
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">Prompt</label>
-            <textarea
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="Step-by-step instructions for the agent..."
-              rows={6}
-              className="mt-1 w-full rounded-md border bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring resize-y"
-            />
-          </div>
-
-          {/* Agent */}
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">Agent</label>
-            <Select value={assigneeId} onValueChange={(v) => v && setAssigneeId(v)}>
-              <SelectTrigger className="mt-1 w-full">
-                <SelectValue>
-                  {(value: string | null) => {
-                    if (!value) return "Select agent...";
-                    const agent = activeAgents.find((a) => a.id === value);
-                    return agent?.name ?? "Unknown Agent";
-                  }}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {activeAgents.map((a) => (
-                  <SelectItem key={a.id} value={a.id}>
-                    {a.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Schedule */}
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">Schedule</label>
-            <div className="mt-2">
-              <TriggerConfigSection config={triggerConfig} onChange={setTriggerConfig} />
-            </div>
-          </div>
-
-          {/* Actions */}
-          <div className="flex justify-end gap-2 pt-1">
-            <Button size="sm" variant="outline" onClick={() => onOpenChange(false)}>
-              Cancel
-            </Button>
-            <Button size="sm" onClick={handleSubmit} disabled={!title.trim() || !assigneeId || submitting}>
-              {submitting ? "Creating..." : "Create"}
-            </Button>
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
   );
 }
 
@@ -367,7 +200,7 @@ export function AutopilotsPage() {
       <div className="flex-1 overflow-y-auto">
         {isLoading ? (
           <>
-            <div className="sticky top-0 z-[1] flex h-8 items-center gap-2 border-b bg-muted/30 px-5">
+            <div className="sticky top-0 z-[1] hidden h-8 items-center gap-2 border-b bg-muted/30 px-5 sm:flex">
               <span className="shrink-0 w-4" />
               <Skeleton className="h-3 w-12 flex-1 max-w-[48px]" />
               <Skeleton className="h-3 w-12 shrink-0" />
@@ -375,9 +208,9 @@ export function AutopilotsPage() {
               <Skeleton className="h-3 w-10 shrink-0" />
               <Skeleton className="h-3 w-12 shrink-0" />
             </div>
-            <div className="p-5 pt-1 space-y-1">
+            <div className="space-y-2 p-4 sm:space-y-1 sm:p-5 sm:pt-1">
               {Array.from({ length: 4 }).map((_, i) => (
-                <Skeleton key={i} className="h-11 w-full" />
+                <Skeleton key={i} className="h-[72px] w-full sm:h-11" />
               ))}
             </div>
           </>
@@ -415,7 +248,7 @@ export function AutopilotsPage() {
         ) : (
           <>
             {/* Column headers */}
-            <div className="sticky top-0 z-[1] flex h-8 items-center gap-2 border-b bg-muted/30 px-5 text-xs font-medium text-muted-foreground">
+            <div className="sticky top-0 z-[1] hidden h-8 items-center gap-2 border-b bg-muted/30 px-5 text-xs font-medium text-muted-foreground sm:flex">
               <span className="shrink-0 w-4" />
               <span className="min-w-0 flex-1">Name</span>
               <span className="w-32 shrink-0">Agent</span>
@@ -430,7 +263,23 @@ export function AutopilotsPage() {
         )}
       </div>
 
-      <CreateAutopilotDialog open={createOpen} onOpenChange={setCreateOpen} template={selectedTemplate} />
+      {createOpen && (
+        <AutopilotDialog
+          mode="create"
+          open={createOpen}
+          onOpenChange={setCreateOpen}
+          initial={
+            selectedTemplate
+              ? { title: selectedTemplate.title, description: selectedTemplate.prompt }
+              : undefined
+          }
+          initialTriggerConfig={
+            selectedTemplate
+              ? { frequency: selectedTemplate.frequency, time: selectedTemplate.time }
+              : undefined
+          }
+        />
+      )}
     </div>
   );
 }
